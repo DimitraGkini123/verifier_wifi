@@ -1,0 +1,4 @@
+{"ts_ms":1768688837358,"device":"pico2w_1","event":"ok","since":10126,"from":0,"to":0,"count":0,"dropped_old":0,"dropped_overflow":0,"rtt_ms":15}
+{"ts_ms":1768688838426,"device":"pico2w_1","event":"ok","since":10126,"from":0,"to":0,"count":0,"dropped_old":11,"dropped_overflow":0,"rtt_ms":66}
+{"ts_ms":1768688839321,"device":"pico2w_1","event":"initial_attest","trust_state":"UNTRUSTED","resp":{"type":"ATTEST_RESPONSE","req_id":"9b44927cd122ff73","mode":"FULL_HASH_PROVER","region":"fw","fw_hash_hex":"b8370619aaf7c3460d106f58232727829c364ab7e7ef1530c4f2d065b3f894d5","response_hex":"3c441ce7688b157fef1b7d345378cbbaff17e17e5051f3a0fd8be91bd6a0ee67","verify_ok":false,"verify_reason":"nonce_bound_mismatch"}}
+{"ts_ms":1768688839444,"device":"pico2w_1","event":"ok","since":10126,"from":0,"to":0,"count":0,"dropped_old":10,"dropped_overflow":0,"rtt_ms":4}
