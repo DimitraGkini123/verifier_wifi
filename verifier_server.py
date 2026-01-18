@@ -16,6 +16,13 @@ TRUST_TRUSTED = "TRUSTED"
 TRUST_UNTRUSTED = "UNTRUSTED"
 
 # ---------------- Auto collection config ----------------
+# ---------------- Periodic attestation config ----------------
+AUTO_ATTEST = True
+FULL_ATTEST_PERIOD_S = 60
+PARTIAL_ATTEST_PERIOD_S = 10
+PARTIAL_K = [1,2,3,4,5,6,7,8,9]
+ATTEST_JITTER_S = 1.0
+
 AUTO_COLLECT = True
 COLLECT_PERIOD_MS = 1000        # poll every 500ms
 COLLECT_MAX_WINDOWS = 10      # 500ms -> 5 windows (100ms each)
@@ -23,6 +30,7 @@ import os
 import tempfile
 
 # ----------------- helpers -----------------
+
 def save_json_atomic(path: str, obj: dict):
     d = os.path.dirname(os.path.abspath(path)) or "."
     fd, tmp = tempfile.mkstemp(prefix="golden_", suffix=".json", dir=d)
@@ -80,6 +88,29 @@ class DeviceConn:
 
 
 class VerifierServer:
+        #creates log for attestations 
+    def log_attest_event(self, dev: str, kind: str, k: int | None, indices: list[int] | None,
+                        resp: dict, trust_before: str, trust_after: str):
+        fp = self.attest_fp.get(dev)
+        if not fp:
+            return
+        self._jwrite(fp, {
+            "ts_ms": ts_ms(),
+            "device": dev,
+            "event": "attest",
+            "attest_kind": kind,
+            "k": k,
+            "indices": indices,
+            "trust_before": trust_before,
+            "trust_after": trust_after,
+            "verify_ok": resp.get("verify_ok"),
+            "verify_reason": resp.get("verify_reason", resp.get("reason")),
+            "rtt_ms": resp.get("_rtt_ms"),
+            "req_bytes": resp.get("_req_bytes"),
+            "resp_bytes": resp.get("_resp_bytes"),
+            "compute_us_total": resp.get("compute_us_total"),   # από prover (θα το βάλεις)
+        })
+
 
     def has_golden_full(self, device_id: str, region: str = "fw") -> bool:
         try:
@@ -236,6 +267,24 @@ class VerifierServer:
             "block_count": block_count
         }
 
+    async def send_request_timed(self, device_id: str, msg: dict, timeout: float = 5.0) -> dict:
+        # bytes of request line (approx exact, because jdump is exact line we send)
+        req_line = jdump({**msg, "req_id": "0000000000000000"})  # placeholder
+        req_bytes = len(req_line)
+
+        t0 = time.perf_counter()
+        resp = await self.send_request(device_id, msg, timeout=timeout)
+        rtt_ms = (time.perf_counter() - t0) * 1000.0
+
+        # response bytes: we don't have raw line here; approximate with json dump
+        resp_bytes = len(jdump(resp)) if isinstance(resp, dict) else 0
+
+        if isinstance(resp, dict):
+            resp["_rtt_ms"] = round(rtt_ms, 2)
+            resp["_req_bytes"] = int(req_bytes)
+            resp["_resp_bytes"] = int(resp_bytes)
+        return resp
+
     
     def __init__(self, golden_db: dict):
         self.golden = golden_db
@@ -250,6 +299,12 @@ class VerifierServer:
         self.collect_tasks: Dict[str, asyncio.Task] = {}
         self.windows_fp: Dict[str, Any] = {}
         self.events_fp: Dict[str, Any] = {}
+
+        
+     # auto-attestation
+        self.attest_tasks: Dict[str, asyncio.Task] = {}
+        self.attest_fp: Dict[str, Any] = {}
+        self.partial_k_cursor: Dict[str, int] = {}
 
     # -------- golden access --------
     def golden_full_hash(self, device_id: str, region: str = "fw") -> Optional[bytes]:
@@ -271,11 +326,14 @@ class VerifierServer:
         stamp = time.strftime("%Y%m%d_%H%M%S")
         wpath = f"windows_{dev}_{stamp}.jsonl"
         epath = f"events_{dev}_{stamp}.jsonl"
+        apath = apath = f"attest_{dev}_{stamp}.jsonl"
         self.windows_fp[dev] = open(wpath, "a", encoding="utf-8", buffering=1)
         self.events_fp[dev] = open(epath, "a", encoding="utf-8", buffering=1)
+        self.attest_fp[dev] = open(apath, "a", encoding="utf-8", buffering=1)
         print(f"[{now_s()}] [COLLECT] files for {dev}:")
         print(f"  windows -> {wpath}")
         print(f"  events  -> {epath}")
+        print(f"  attest  -> {apath}")
 
     @staticmethod
     def _jwrite(fp, obj: dict):
@@ -285,11 +343,14 @@ class VerifierServer:
     def _close_files_for(self, dev: str):
         fpw = self.windows_fp.pop(dev, None)
         fpe = self.events_fp.pop(dev, None)
+        fpa = self.attest_fp.pop(dev, None)
         try:
             if fpw:
                 fpw.close()
             if fpe:
                 fpe.close()
+            if fpa:
+                fpa.close()
         except Exception:
             pass
 
@@ -344,6 +405,17 @@ class VerifierServer:
                     self.collector_loop(device_id, COLLECT_PERIOD_MS, COLLECT_MAX_WINDOWS)
                 )
                 print(f"[{now_s()}] [COLLECT] started for {device_id} every {COLLECT_PERIOD_MS}ms, max={COLLECT_MAX_WINDOWS}")
+        
+        if AUTO_ATTEST:
+            # σιγουρέψου ότι έχουν ανοιχτεί files
+            self._open_files_for(device_id)
+
+            if device_id not in self.attest_tasks or self.attest_tasks[device_id].done():
+                self.attest_tasks[device_id] = asyncio.create_task(self.periodic_attest_loop(device_id))
+                print(
+                    f"[{now_s()}] [ATTEST] periodic started for {device_id} "
+                    f"(partial={PARTIAL_ATTEST_PERIOD_S}s k={PARTIAL_K}, full={FULL_ATTEST_PERIOD_S}s)"
+                )
 
         # Start RX loop
         try:
@@ -363,6 +435,13 @@ class VerifierServer:
                 del self.devices[device_id]
                 if self.selected_device == device_id:
                     self.selected_device = next(iter(self.devices), None)
+                        # stop attestation task on disconnect
+            at = self.attest_tasks.get(device_id)
+            if at and not at.done():
+                at.cancel()
+            self.attest_tasks.pop(device_id, None)
+            self.partial_k_cursor.pop(device_id, None)
+
 
             writer.close()
             await writer.wait_closed()
@@ -656,7 +735,7 @@ class VerifierServer:
                 k = max(1, min(k, bc))
                 indices = sorted(random.sample(range(bc), k)) #always exactly k blocks 
                 nonce = secrets.token_hex(8)
-                coro = self.send_request(dev, {
+                coro = self.send_request_timed(dev, {
                     "type": "ATTEST_REQUEST",
                     "mode": "PARTIAL_BLOCKS",
                     "region": "fw",
@@ -689,7 +768,7 @@ class VerifierServer:
 
     async def attest_full_once(self, dev: str, timeout: float = 8.0) -> dict:
         nonce = secrets.token_hex(8)
-        resp = await self.send_request(dev, {
+        resp = await self.send_request_timed(dev, {
             "type": "ATTEST_REQUEST",
             "mode": "FULL_HASH_PROVER",
             "region": "fw",
@@ -710,6 +789,13 @@ class VerifierServer:
             return
 
         ok = bool(resp.get("verify_ok", False))
+
+        if reason in ("missing_golden_blocks", "no_golden_blocks"):
+            dc.trust_state = TRUST_UNKNOWN
+            dc.attest_fail_streak = 0
+            print(f"[{now_s()}] [ATTEST] {dev}: no golden blocks yet -> TRUST_UNKNOWN (not a fail)")
+            return
+
 
         if ok:
             dc.trust_state = TRUST_TRUSTED
@@ -738,6 +824,137 @@ class VerifierServer:
         resp2 = await self.attest_full_once(dev, timeout=8.0)
         self._update_trust_from_attest(dev, resp2, attempt=2)
         return resp2
+    
+    async def attest_full_and_log(self, dev: str) -> dict:
+        dc = self.devices.get(dev)
+        if not dc:
+            return {"type": "ERROR", "reason": "device_not_connected"}
+
+        trust_before = dc.trust_state
+
+        resp = await self.attest_full_with_retry(dev)  # ήδη timed & verify μέσα
+
+        trust_after = dc.trust_state if dev in self.devices else TRUST_UNKNOWN
+        self.log_attest_event(
+            dev=dev,
+            kind="FULL",
+            k=None,
+            indices=None,
+            resp=resp if isinstance(resp, dict) else {"type": "ERROR", "reason": "bad_resp"},
+            trust_before=trust_before,
+            trust_after=trust_after
+        )
+        return resp
+
+    async def attest_partial_once(self, dev: str, k: int, timeout: float = 12.0) -> dict:
+        bc = self.get_block_count(dev)
+        if bc <= 0:
+            return {"type": "ERROR", "reason": "no_golden_blocks"}
+
+        k = max(1, min(int(k), bc))
+        indices = sorted(random.sample(range(bc), k))
+        nonce = secrets.token_hex(8)
+
+        resp = await self.send_request_timed(dev, {
+            "type": "ATTEST_REQUEST",
+            "mode": "PARTIAL_BLOCKS",
+            "region": "fw",
+            "nonce": nonce,
+            "indices": indices
+        }, timeout=timeout)
+
+        # βάλε για logging (εύκολο!)
+        if isinstance(resp, dict):
+            resp["_k"] = k
+            resp["_indices"] = indices
+
+        return resp
+
+    async def attest_partial_and_log(self, dev: str, k: int) -> dict:
+        dc = self.devices.get(dev)
+        if not dc:
+            return {"type": "ERROR", "reason": "device_not_connected"}
+
+        trust_before = dc.trust_state
+
+        resp = await self.attest_partial_once(dev, k=k, timeout=12.0)
+
+        # ενημέρωση trust με ίδια λογική
+        self._update_trust_from_attest(dev, resp if isinstance(resp, dict) else {}, attempt=1)
+
+        trust_after = dc.trust_state if dev in self.devices else TRUST_UNKNOWN
+
+        indices = resp.get("_indices") if isinstance(resp, dict) else None
+        kk = resp.get("_k") if isinstance(resp, dict) else k
+
+        self.log_attest_event(
+            dev=dev,
+            kind="PARTIAL",
+            k=kk,
+            indices=indices,
+            resp=resp if isinstance(resp, dict) else {"type": "ERROR", "reason": "bad_resp"},
+            trust_before=trust_before,
+            trust_after=trust_after
+        )
+        return resp
+    
+    def pick_next_partial_k(self, dev: str) -> int:
+        if not PARTIAL_K:
+            return 1
+        cur = self.partial_k_cursor.get(dev, 0)
+        k = PARTIAL_K[cur % len(PARTIAL_K)]
+        self.partial_k_cursor[dev] = cur + 1
+        return int(k)
+
+
+    async def periodic_attest_loop(self, dev: str):
+        await asyncio.sleep(1.0)
+
+        next_full = time.time() + FULL_ATTEST_PERIOD_S
+        next_partial = time.time() + PARTIAL_ATTEST_PERIOD_S
+
+        while True:
+            if dev not in self.devices:
+                return
+
+            now = time.time()
+
+            # PARTIAL (πιο συχνό)
+            if now >= next_partial:
+                await asyncio.sleep(random.random() * ATTEST_JITTER_S)
+                try:
+                    k = self.pick_next_partial_k(dev)
+                    await self.attest_partial_and_log(dev, k=k)
+                except Exception as e:
+                    fp = self.events_fp.get(dev)
+                    if fp:
+                        self._jwrite(fp, {
+                            "ts_ms": ts_ms(),
+                            "device": dev,
+                            "event": "attest_partial_error",
+                            "err": str(e)
+                        })
+                next_partial = time.time() + PARTIAL_ATTEST_PERIOD_S
+
+            # FULL (πιο αραιό)
+            if now >= next_full:
+                await asyncio.sleep(random.random() * ATTEST_JITTER_S)
+                try:
+                    await self.attest_full_and_log(dev)
+                except Exception as e:
+                    fp = self.events_fp.get(dev)
+                    if fp:
+                        self._jwrite(fp, {
+                            "ts_ms": ts_ms(),
+                            "device": dev,
+                            "event": "attest_full_error",
+                            "err": str(e)
+                        })
+                next_full = time.time() + FULL_ATTEST_PERIOD_S
+
+            await asyncio.sleep(0.2)
+
+
 
 
 
