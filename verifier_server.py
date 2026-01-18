@@ -10,6 +10,8 @@ from typing import Dict, Any, Optional
 from utils import save_json_atomic, jdump, sha256, ts_ms, now_s, unhex
 from utils import now_s, ts_ms
 
+from policy_device_lr import DeviceLRPolicy
+
 
 
 HOST = "0.0.0.0"
@@ -30,10 +32,10 @@ ATTEST_JITTER_S = 1.0
 AUTO_COLLECT = True
 COLLECT_PERIOD_MS = 1000        # poll every 500ms
 COLLECT_MAX_WINDOWS = 10      # 500ms -> 5 windows (100ms each)
-import os
-import tempfile
-
-
+MODEL_PATH = "models/verifier_models_per_device.joblib"
+ML_ENABLE = True
+ML_TRIGGER_ATTEST = True   # αν θες να στέλνει attestation βάσει inference
+ML_COOLDOWN_S = 10.0       # για να μη σπαμάρει
 
 # ----------------- device session -----------------
 @dataclass
@@ -56,7 +58,6 @@ class DeviceConn:
 
     def is_alive(self) -> bool:
         return not self.writer.is_closing()
-
 
 
 class VerifierServer:
@@ -277,6 +278,10 @@ class VerifierServer:
         self.attest_tasks: Dict[str, asyncio.Task] = {}
         self.attest_fp: Dict[str, Any] = {}
         self.partial_k_cursor: Dict[str, int] = {}
+    ##model 
+        self.policy = DeviceLRPolicy(MODEL_PATH) if ML_ENABLE else None
+        self.last_ml_trigger_ts: Dict[str, float] = {}
+
 
 
     # -------- golden access --------
@@ -578,65 +583,147 @@ class VerifierServer:
         self._open_files_for(dev)
 
         while True:
-            since = int(self.last_seen.get(dev, 0))
-            t0 = time.time()
-            resp = await self.send_request(dev, {
-                "type": "GET_WINDOWS",
-                "since": since,
-                "max": max_windows
-            }, timeout=8.0)
-            rtt_ms = int((time.time() - t0) * 1000)
+            try:
+                since = int(self.last_seen.get(dev, 0))
 
-            if resp.get("type") == "WINDOWS":
-                cnt = int(resp.get("count", 0))
-                to_id = int(resp.get("to", since) or since)
-                if to_id:
-                    self.last_seen[dev] = to_id
-
-                # event record
-                self._jwrite(self.events_fp[dev], {
-                    "ts_ms": ts_ms(),
-                    "device": dev,
-                    "event": "ok",
+                t0 = time.perf_counter()
+                resp = await self.send_request(dev, {
+                    "type": "GET_WINDOWS",
                     "since": since,
-                    "from": resp.get("from"),
-                    "to": resp.get("to"),
-                    "count": cnt,
-                    "dropped_old": resp.get("dropped_old"),
-                    "dropped_overflow": resp.get("dropped_overflow"),
-                    "rtt_ms": rtt_ms
-                })
+                    "max": int(max_windows),
+                }, timeout=8.0)
+                rtt_ms = int((time.perf_counter() - t0) * 1000)
 
-                # windows records (one json per line)
-                tnow = time.time()
-                dc = self.devices.get(dev)
-                trust = dc.trust_state if dc else TRUST_UNKNOWN
-
-                for w in resp.get("windows", []):
-                    # “Stop trusting” σημαίνει: δεν τα χρησιμοποιώ για decisions (inference/alerts),
-                    # αλλά τα αποθηκεύω. Εδώ τα tag-άρεις.
-                    self._jwrite(self.windows_fp[dev], {
-                        "ts": tnow,
-                        "device_id_str": dev,
-                        "trust_state": trust,
-                        "trusted_for_decision": (trust == TRUST_TRUSTED),
-                        **w
-                    })
-
-            else:
-                # log error event (so file is never empty if streaming fails)
-                fp = self.events_fp.get(dev)
-                if fp:
-                    self._jwrite(fp, {
+                # πάντα γράψε event για να ξέρεις ότι ο loop ζει
+                fp_evt = self.events_fp.get(dev)
+                if fp_evt:
+                    self._jwrite(fp_evt, {
                         "ts_ms": ts_ms(),
                         "device": dev,
-                        "event": "error",
+                        "event": "collector_tick",
                         "since": since,
                         "rtt_ms": rtt_ms,
-                        "resp": resp
+                        "resp_type": resp.get("type"),
+                    })
+
+                if resp.get("type") != "WINDOWS":
+                    # log error response
+                    if fp_evt:
+                        self._jwrite(fp_evt, {
+                            "ts_ms": ts_ms(),
+                            "device": dev,
+                            "event": "collector_error",
+                            "since": since,
+                            "rtt_ms": rtt_ms,
+                            "resp": resp,
+                        })
+                    await asyncio.sleep(period_ms / 1000.0)
+                    continue
+
+                windows = resp.get("windows", []) or []
+                cnt = int(resp.get("count", len(windows)) or 0)
+
+                # --- update cursor robustly ---
+                # 1) prefer resp["to"]
+                to_id = resp.get("to", None)
+                if to_id is not None:
+                    try:
+                        to_id = int(to_id)
+                    except Exception:
+                        to_id = None
+
+                # 2) if "to" missing/invalid, compute from last window
+                if (to_id is None) and windows:
+                    # assumes each window dict has "window_id"
+                    try:
+                        to_id = int(windows[-1].get("window_id"))
+                    except Exception:
+                        to_id = None
+
+                # IMPORTANT: make it "next since" (avoid refetching same window)
+                if to_id is not None:
+                    self.last_seen[dev] = to_id + 1
+
+                # log summary
+                if fp_evt:
+                    self._jwrite(fp_evt, {
+                        "ts_ms": ts_ms(),
+                        "device": dev,
+                        "event": "windows_ok",
+                        "since": since,
+                        "from": resp.get("from"),
+                        "to": resp.get("to"),
+                        "cursor_set_to": self.last_seen.get(dev),
+                        "count": cnt,
+                        "dropped_old": resp.get("dropped_old"),
+                        "dropped_overflow": resp.get("dropped_overflow"),
+                        "rtt_ms": rtt_ms,
+                    })
+
+                # write window lines
+                fp_win = self.windows_fp.get(dev)
+                dc = self.devices.get(dev)
+                trust = dc.trust_state if dc else TRUST_UNKNOWN
+                tnow = time.time()
+
+                if fp_win:
+                    for w in windows:
+                        self._jwrite(fp_win, {
+                            "ts": tnow,
+                            "device_id_str": dev,
+                            "trust_state": trust,
+                            "trusted_for_decision": (trust == TRUST_TRUSTED),
+                            **w
+                        })
+                # ---------------- ML inference + optional attestation trigger ----------------
+                if self.policy is not None and windows:
+                    w_last = windows[-1]
+
+                    pred = self.policy.predict(dev, w_last)
+                    decision = self.policy.decide(pred.get("label"))
+
+                    # log inference event
+                    if fp_evt:
+                        self._jwrite(fp_evt, {
+                            "ts_ms": ts_ms(),
+                            "device": dev,
+                            "event": "ml_inference",
+                            "pred_ok": pred.get("ok"),
+                            "pred_reason": pred.get("reason"),
+                            "device_int": pred.get("device_int"),
+                            "label": str(pred.get("label")),
+                            "decision": decision,
+                            "window_id": w_last.get("window_id"),
+                        })
+
+                    # optional: trigger attestation (cooldown to avoid spam)
+                    if ML_TRIGGER_ATTEST:
+                        now_t = time.time()
+                        last_t = self.last_ml_trigger_ts.get(dev, 0.0)
+
+                        if now_t - last_t >= ML_COOLDOWN_S:
+                            self.last_ml_trigger_ts[dev] = now_t
+
+                            if decision.get("action") == "FULL":
+                                asyncio.create_task(self.attest_full_and_log(dev))
+                            elif decision.get("action") == "PARTIAL":
+                                k = int(decision.get("k", 3))
+                                asyncio.create_task(self.attest_partial_and_log(dev, k=k))
+
+            except Exception as e:
+                # αν ο loop σκάσει, μην πεθάνει. Γράψε το.
+                fp_evt = self.events_fp.get(dev)
+                if fp_evt:
+                    self._jwrite(fp_evt, {
+                        "ts_ms": ts_ms(),
+                        "device": dev,
+                        "event": "collector_exception",
+                        "err": str(e),
                     })
 
             await asyncio.sleep(period_ms / 1000.0)
+
+
 
     # -------- CLI (runs in thread) --------
     def cli_thread(self):
