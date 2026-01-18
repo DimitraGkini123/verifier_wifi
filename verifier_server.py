@@ -4,6 +4,7 @@ import secrets
 import hashlib
 import threading
 import time
+import random
 from dataclasses import dataclass, field
 from typing import Dict, Any, Optional
 
@@ -120,6 +121,7 @@ class VerifierServer:
 
         self.set_golden_full_hash(dev, region, fw_hex)
         return {"type": "OK", "event": "golden_provisioned", "device": dev, "region": region, "fw_hash_hex": fw_hex}
+    
     async def force_provision_golden_full(self, dev: str, region: str = "fw") -> dict:
         nonce = secrets.token_hex(8)
         resp = await self.send_request(dev, {
@@ -136,6 +138,105 @@ class VerifierServer:
         self.set_golden_full_hash(dev, region, fw_hex)
         return {"type": "OK", "event": "golden_overwritten", "device": dev, "region": region, "fw_hash_hex": fw_hex}
 
+    #for partial hash 
+    def has_golden_blocks(self, device_id: str) -> bool:
+        try:
+            _ = self.golden[device_id]["blocks"]["hashes"]
+            return True
+        except Exception:
+            return False
+
+    def get_block_count(self, device_id: str) -> int:
+        try:
+            return int(self.golden[device_id]["blocks"]["block_count"])
+        except Exception:
+            return 0
+
+    def set_golden_blocks(self, device_id: str, block_size: int, hashes_hex: list[str], force: bool = False):
+        if device_id not in self.golden:
+            self.golden[device_id] = {}
+
+        # guard: μην overwrite κατά λάθος
+        if (not force) and self.has_golden_blocks(device_id):
+            raise RuntimeError("golden_blocks_already_exist_refusing_overwrite")
+
+        self.golden[device_id]["blocks"] = {
+            "block_size": int(block_size),
+            "block_count": int(len(hashes_hex)),
+            "hashes": [h.lower() for h in hashes_hex],
+        }
+        save_json_atomic(GOLDEN_PATH, self.golden)
+
+    async def provision_golden_blocks(self, dev: str, force: bool = False) -> dict:
+        # guard: μην overwrite αν υπάρχει ήδη
+        if self.has_golden_blocks(dev) and not force:
+            return {"type": "ERROR", "reason": "golden_blocks_already_exists_refusing_overwrite", "device": dev}
+
+        # 1) Probe (ζήτα 1 block) για να πάρεις metadata
+        nonce = secrets.token_hex(8)
+        probe = await self.send_request(dev, {
+            "type": "ATTEST_REQUEST",
+            "mode": "PARTIAL_BLOCKS",
+            "region": "fw",
+            "nonce": nonce,
+            "indices": [0]
+        }, timeout=12.0)
+
+        if probe.get("type") != "ATTEST_RESPONSE" or probe.get("mode") != "PARTIAL_BLOCKS":
+            return {"type": "ERROR", "reason": "bad_probe_response", "resp": probe}
+
+        block_count = int(probe.get("block_count", 0) or 0)
+
+        # accept either "block_size" or infer from first block's "len"
+        block_size = int(probe.get("block_size", 0) or 0)
+        if block_size <= 0:
+            blocks0 = probe.get("blocks", [])
+            if blocks0 and isinstance(blocks0, list):
+                block_size = int(blocks0[0].get("len", 0) or 0)
+
+        if block_size <= 0 or block_count <= 0:
+            return {"type": "ERROR", "reason": "missing_block_meta", "resp": probe}
+
+
+        # 2) Ζήτα ΟΛΑ τα blocks
+        nonce = secrets.token_hex(8)
+        indices = list(range(block_count))
+        resp = await self.send_request(dev, {
+            "type": "ATTEST_REQUEST",
+            "mode": "PARTIAL_BLOCKS",
+            "region": "fw",
+            "nonce": nonce,
+            "indices": indices
+        }, timeout=30.0)
+
+        if resp.get("type") != "ATTEST_RESPONSE" or resp.get("mode") != "PARTIAL_BLOCKS":
+            return {"type": "ERROR", "reason": "bad_blocks_response", "resp": resp}
+
+        blocks = resp.get("blocks", [])
+        got = {}
+        for b in blocks:
+            if "index" in b and "hash_hex" in b:
+                got[int(b["index"])] = b["hash_hex"]
+
+        if len(got) < block_count:
+            return {"type": "ERROR", "reason": "missing_some_blocks", "got": len(got), "need": block_count}
+
+        hashes = [got[i] for i in range(block_count)]
+
+        try:
+            self.set_golden_blocks(dev, block_size, hashes, force=force)
+        except RuntimeError as e:
+            return {"type": "ERROR", "reason": str(e)}
+
+        return {
+            "type": "OK",
+            "event": "golden_blocks_provisioned" if not force else "golden_blocks_overwritten",
+            "device": dev,
+            "block_size": block_size,
+            "block_count": block_count
+        }
+
+    
     def __init__(self, golden_db: dict):
         self.golden = golden_db
         self.devices: Dict[str, DeviceConn] = {}
@@ -347,6 +448,14 @@ class VerifierServer:
             return received
 
         if mode == "PARTIAL_BLOCKS" and rtype == "ATTEST_RESPONSE":
+            if not self.has_golden_blocks(device_id):
+                received["verify_ok"] = False
+                received["verify_reason"] = "missing_golden_blocks"
+                return received
+
+            nonce_hex = sent.get("nonce")  # <- NEW
+            nonce = unhex(nonce_hex) if nonce_hex else None
+
             blocks = received.get("blocks", [])
             all_ok = True
             reasons = []
@@ -364,12 +473,20 @@ class VerifierServer:
                     reasons.append(f"missing_golden_block_{idx}")
                     continue
 
-                if "hash_hex" in b:
+                ok = False
+
+                # NEW: nonce-bound verification
+                if nonce is not None and "response_hex" in b:
+                    expected = sha256(nonce + golden_b)
+                    got = unhex(b["response_hex"])
+                    ok = (got == expected)
+
+                # fallback: direct hash compare (useful for provisioning/debug)
+                elif "hash_hex" in b:
                     ok = (unhex(b["hash_hex"]) == golden_b)
+
                 elif "data_hex" in b:
                     ok = (sha256(unhex(b["data_hex"])) == golden_b)
-                else:
-                    ok = False
 
                 if not ok:
                     all_ok = False
@@ -378,6 +495,7 @@ class VerifierServer:
             received["verify_ok"] = all_ok
             received["verify_reason"] = "ok" if all_ok else ",".join(reasons)
             return received
+
 
         return received
 
@@ -479,6 +597,8 @@ class VerifierServer:
         print("  attest_partial <k>")
         print("  provision_golden     (fetch fw_hash_hex and store to golden.json)")
         print("  force_provision_golden  (overwrite golden!)")
+        print("  provision_blocks      (fetch all block hashes and store to golden.json)")
+        print("  force_provision_blocks (overwrite blocks!)")
         print("  quit\n")
 
         while True:
@@ -527,7 +647,14 @@ class VerifierServer:
             elif cmd.startswith("attest_partial"):
                 parts = cmd.split()
                 k = int(parts[1]) if len(parts) > 1 else 3
-                indices = sorted({secrets.randbelow(20) for _ in range(k)})
+
+                bc = self.get_block_count(dev)
+                if bc <= 0:
+                    print("No golden blocks yet. Run: provision_blocks")
+                    continue
+
+                k = max(1, min(k, bc))
+                indices = sorted(random.sample(range(bc), k)) #always exactly k blocks 
                 nonce = secrets.token_hex(8)
                 coro = self.send_request(dev, {
                     "type": "ATTEST_REQUEST",
@@ -535,11 +662,16 @@ class VerifierServer:
                     "region": "fw",
                     "nonce": nonce,
                     "indices": indices
-                }, timeout=8.0)
+                }, timeout=12.0)
             elif cmd == "provision_golden":
                 coro = self.provision_golden_full(dev, region="fw")
             elif cmd == "force_provision_golden":
                 coro = self.force_provision_golden_full(dev, region="fw")
+            elif cmd == "provision_blocks":
+                coro = self.provision_golden_blocks(dev, force=False)
+            elif cmd == "force_provision_blocks":
+                coro = self.provision_golden_blocks(dev, force=True)
+
             else:
                 print("unknown command")
                 continue
@@ -566,6 +698,10 @@ class VerifierServer:
         return resp
 
     def _update_trust_from_attest(self, dev: str, resp: dict, attempt: int):
+        dc = self.devices.get(dev)
+        if not dc:
+            return
+
         reason = resp.get("verify_reason", resp.get("reason", "unknown"))
         if reason == "missing_golden_full_hash":
             dc.trust_state = TRUST_UNKNOWN
@@ -573,12 +709,7 @@ class VerifierServer:
             print(f"[{now_s()}] [ATTEST] {dev}: no golden yet -> TRUST_UNKNOWN (not a fail)")
             return
 
-        dc = self.devices.get(dev)
-        if not dc:
-            return
-
         ok = bool(resp.get("verify_ok", False))
-        reason = resp.get("verify_reason", resp.get("reason", "unknown"))
 
         if ok:
             dc.trust_state = TRUST_TRUSTED
@@ -589,11 +720,10 @@ class VerifierServer:
             dc.attest_fail_streak += 1
             dc.last_attest_fail_ts = time.time()
             print(f"[{now_s()}] [ATTEST] {dev} FAIL (attempt={attempt}) reason={reason}")
-
-            # Αν είναι δεύτερη συνεχόμενη αποτυχία → UNTRUSTED
             if dc.attest_fail_streak >= 2:
                 dc.trust_state = TRUST_UNTRUSTED
                 print(f"[{now_s()}] [TRUST] {dev} => UNTRUSTED (2 consecutive fails)")
+
 
     async def attest_full_with_retry(self, dev: str) -> dict:
         # 1η προσπάθεια
