@@ -1,10 +1,7 @@
 import joblib
 import numpy as np
 from typing import Dict, Any
-MODEL_PATH = "models/verifier_models_per_device.joblib"
-ML_ENABLE = True
-ML_TRIGGER_ATTEST = True   # αν θες να στέλνει attestation βάσει inference
-ML_COOLDOWN_S = 10.0       # για να μη σπαμάρει
+
 
 class DeviceLRPolicy:
     """
@@ -51,11 +48,6 @@ class DeviceLRPolicy:
             return {"ok": False, "reason": f"predict_error:{e}", "label": None}
 
     def decide(self, label: Any) -> Dict[str, Any]:
-        """
-        Super simple wiring test:
-          - label == 0 => PARTIAL k=3
-          - else       => FULL
-        """
         if label is None:
             return {"action": "FULL", "reason": "no_label_fallback_full"}
 

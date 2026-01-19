@@ -63,7 +63,9 @@ class DeviceConn:
 class VerifierServer:
         #creates log for attestations 
     def log_attest_event(self, dev: str, kind: str, k: int | None, indices: list[int] | None,
-                        resp: dict, trust_before: str, trust_after: str):
+                     resp: dict, trust_before: str, trust_after: str,
+                     trigger: str = "UNKNOWN", ml: dict | None = None):
+
         fp = self.attest_fp.get(dev)
         if not fp:
             return
@@ -72,6 +74,8 @@ class VerifierServer:
             "device": dev,
             "event": "attest",
             "attest_kind": kind,
+            "trigger": trigger,          # <-- NEW
+            "ml": ml,         
             "k": k,
             "indices": indices,
             "trust_before": trust_before,
@@ -282,6 +286,14 @@ class VerifierServer:
         self.policy = DeviceLRPolicy(MODEL_PATH) if ML_ENABLE else None
         self.last_ml_trigger_ts: Dict[str, float] = {}
 
+        self.attest_locks: Dict[str, asyncio.Lock] = {}
+#helper 
+    def _attest_lock(self, dev: str) -> asyncio.Lock:
+        lk = self.attest_locks.get(dev)
+        if lk is None:
+            lk = asyncio.Lock()
+            self.attest_locks[dev] = lk
+        return lk
 
 
     # -------- golden access --------
@@ -695,6 +707,14 @@ class VerifierServer:
                             "decision": decision,
                             "window_id": w_last.get("window_id"),
                         })
+                    ml_meta = {
+                        "label": str(pred.get("label")),
+                        "decision": decision,
+                        "window_id": w_last.get("window_id"),
+                        "pred_ok": pred.get("ok"),
+                        "pred_reason": pred.get("reason"),
+                    }
+
 
                     # optional: trigger attestation (cooldown to avoid spam)
                     if ML_TRIGGER_ATTEST:
@@ -703,13 +723,11 @@ class VerifierServer:
 
                         if now_t - last_t >= ML_COOLDOWN_S:
                             self.last_ml_trigger_ts[dev] = now_t
-
                             if decision.get("action") == "FULL":
-                                asyncio.create_task(self.attest_full_and_log(dev))
+                                asyncio.create_task(self.attest_full_and_log(dev, trigger="ML", ml=ml_meta))
                             elif decision.get("action") == "PARTIAL":
                                 k = int(decision.get("k", 3))
-                                asyncio.create_task(self.attest_partial_and_log(dev, k=k))
-
+                                asyncio.create_task(self.attest_partial_and_log(dev, k=k, trigger="ML", ml=ml_meta))
             except Exception as e:
                 # αν ο loop σκάσει, μην πεθάνει. Γράψε το.
                 fp_evt = self.events_fp.get(dev)
@@ -821,7 +839,7 @@ class VerifierServer:
                 if resp.get("type") == "WINDOWS":
                     to_id = resp.get("to", 0)
                     if to_id:
-                        self.last_seen[dev] = int(to_id)
+                        self.last_seen[dev] = int(to_id) + 1
                 print(f"[{now_s()}] [RESP] {resp}")
             except Exception as e:
                 print("error waiting:", e)
@@ -885,26 +903,23 @@ class VerifierServer:
         self._update_trust_from_attest(dev, resp2, attempt=2)
         return resp2
     
-    async def attest_full_and_log(self, dev: str) -> dict:
-        dc = self.devices.get(dev)
-        if not dc:
-            return {"type": "ERROR", "reason": "device_not_connected"}
+    async def attest_full_and_log(self, dev: str, trigger: str = "UNKNOWN", ml: dict | None = None) -> dict:
+        async with self._attest_lock(dev):
+            dc = self.devices.get(dev)
+            if not dc:
+                return {"type": "ERROR", "reason": "device_not_connected"}
 
-        trust_before = dc.trust_state
+            trust_before = dc.trust_state
+            resp = await self.attest_full_with_retry(dev)
+            trust_after = dc.trust_state if dev in self.devices else TRUST_UNKNOWN
 
-        resp = await self.attest_full_with_retry(dev)  # ήδη timed & verify μέσα
-
-        trust_after = dc.trust_state if dev in self.devices else TRUST_UNKNOWN
-        self.log_attest_event(
-            dev=dev,
-            kind="FULL",
-            k=None,
-            indices=None,
-            resp=resp if isinstance(resp, dict) else {"type": "ERROR", "reason": "bad_resp"},
-            trust_before=trust_before,
-            trust_after=trust_after
-        )
-        return resp
+            self.log_attest_event(
+                dev=dev, kind="FULL", k=None, indices=None,
+                resp=resp if isinstance(resp, dict) else {"type": "ERROR", "reason": "bad_resp"},
+                trust_before=trust_before, trust_after=trust_after,
+                trigger=trigger, ml=ml
+            )
+            return resp
 
     async def attest_partial_once(self, dev: str, k: int, timeout: float = 12.0) -> dict:
         bc = self.get_block_count(dev)
@@ -930,33 +945,28 @@ class VerifierServer:
 
         return resp
 
-    async def attest_partial_and_log(self, dev: str, k: int) -> dict:
-        dc = self.devices.get(dev)
-        if not dc:
-            return {"type": "ERROR", "reason": "device_not_connected"}
+    async def attest_partial_and_log(self, dev: str, k: int, trigger: str = "UNKNOWN", ml: dict | None = None) -> dict:
+        async with self._attest_lock(dev):
+            dc = self.devices.get(dev)
+            if not dc:
+                return {"type": "ERROR", "reason": "device_not_connected"}
 
-        trust_before = dc.trust_state
+            trust_before = dc.trust_state
+            resp = await self.attest_partial_once(dev, k=k, timeout=12.0)
+            self._update_trust_from_attest(dev, resp if isinstance(resp, dict) else {}, attempt=1)
 
-        resp = await self.attest_partial_once(dev, k=k, timeout=12.0)
+            trust_after = dc.trust_state if dev in self.devices else TRUST_UNKNOWN
+            indices = resp.get("_indices") if isinstance(resp, dict) else None
+            kk = resp.get("_k") if isinstance(resp, dict) else k
 
-        # ενημέρωση trust με ίδια λογική
-        self._update_trust_from_attest(dev, resp if isinstance(resp, dict) else {}, attempt=1)
+            self.log_attest_event(
+                dev=dev, kind="PARTIAL", k=kk, indices=indices,
+                resp=resp if isinstance(resp, dict) else {"type": "ERROR", "reason": "bad_resp"},
+                trust_before=trust_before, trust_after=trust_after,
+                trigger=trigger, ml=ml
+            )
+            return resp
 
-        trust_after = dc.trust_state if dev in self.devices else TRUST_UNKNOWN
-
-        indices = resp.get("_indices") if isinstance(resp, dict) else None
-        kk = resp.get("_k") if isinstance(resp, dict) else k
-
-        self.log_attest_event(
-            dev=dev,
-            kind="PARTIAL",
-            k=kk,
-            indices=indices,
-            resp=resp if isinstance(resp, dict) else {"type": "ERROR", "reason": "bad_resp"},
-            trust_before=trust_before,
-            trust_after=trust_after
-        )
-        return resp
     
     def pick_next_partial_k(self, dev: str) -> int:
         if not PARTIAL_K:
@@ -966,7 +976,7 @@ class VerifierServer:
         self.partial_k_cursor[dev] = cur + 1
         return int(k)
 
-
+    # i keep the full attestation automatic 
     async def periodic_attest_loop(self, dev: str):
         await asyncio.sleep(1.0)
 
@@ -980,27 +990,28 @@ class VerifierServer:
             now = time.time()
 
             # PARTIAL (πιο συχνό)
-            if now >= next_partial:
-                await asyncio.sleep(random.random() * ATTEST_JITTER_S)
-                try:
-                    k = self.pick_next_partial_k(dev)
-                    await self.attest_partial_and_log(dev, k=k)
-                except Exception as e:
-                    fp = self.events_fp.get(dev)
-                    if fp:
-                        self._jwrite(fp, {
-                            "ts_ms": ts_ms(),
-                            "device": dev,
-                            "event": "attest_partial_error",
-                            "err": str(e)
-                        })
-                next_partial = time.time() + PARTIAL_ATTEST_PERIOD_S
+            #uncomment to enable auto partial attestation 
+            #if now >= next_partial:
+            #    await asyncio.sleep(random.random() * ATTEST_JITTER_S)
+            #    try:
+            #        k = self.pick_next_partial_k(dev)
+            #        await self.attest_partial_and_log(dev, k=k)
+            #    except Exception as e:
+            #        fp = self.events_fp.get(dev)
+            #        if fp:
+            #            self._jwrite(fp, {
+            #                "ts_ms": ts_ms(),
+            #                "device": dev,
+            #                "event": "attest_partial_error",
+            #                "err": str(e)
+            #            })
+            #    next_partial = time.time() + PARTIAL_ATTEST_PERIOD_S
 
             # FULL (πιο αραιό)
             if now >= next_full:
                 await asyncio.sleep(random.random() * ATTEST_JITTER_S)
                 try:
-                    await self.attest_full_and_log(dev)
+                    await self.attest_full_and_log(dev,trigger="PERIODIC" )
                 except Exception as e:
                     fp = self.events_fp.get(dev)
                     if fp:
