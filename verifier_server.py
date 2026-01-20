@@ -9,9 +9,11 @@ from dataclasses import dataclass, field
 from typing import Dict, Any, Optional
 from utils import save_json_atomic, jdump, sha256, ts_ms, now_s, unhex
 from utils import now_s, ts_ms
+from lru_blocks import DeviceLRUBlocks
 
 from policy_device_lr import DeviceLRPolicy
 
+LRU_STATE_PATH = "lru_state.json"
 
 
 HOST = "0.0.0.0"
@@ -30,8 +32,8 @@ PARTIAL_K = [1,2,3,4,5,6,7,8,9]
 ATTEST_JITTER_S = 1.0
 
 AUTO_COLLECT = True
-COLLECT_PERIOD_MS = 1000        # poll every 500ms
-COLLECT_MAX_WINDOWS = 10      # 500ms -> 5 windows (100ms each)
+COLLECT_PERIOD_MS = 600        # poll every 500ms
+COLLECT_MAX_WINDOWS = 6     # 500ms -> 5 windows (100ms each)
 MODEL_PATH = "models/verifier_models_per_device.joblib"
 ML_ENABLE = True
 ML_TRIGGER_ATTEST = True   # αν θες να στέλνει attestation βάσει inference
@@ -261,9 +263,41 @@ class VerifierServer:
             resp["_req_bytes"] = int(req_bytes)
             resp["_resp_bytes"] = int(resp_bytes)
         return resp
+    
+    def _get_block_lru(self, dev: str) -> Optional[DeviceLRUBlocks]:
+        bc = self.get_block_count(dev)
+        if bc <= 0:
+            return None
+        lru = self.block_lru.get(dev)
+        if lru is None:
+            lru = DeviceLRUBlocks.fresh(bc)
+            self.block_lru[dev] = lru
+            self._save_lru_state()
+        else:
+            # if block count changed, reset
+            lru.ensure_size(bc)
+        return lru
+
 
     
     def __init__(self, golden_db: dict):
+        #lru for partial
+                # LRU per device for partial blocks
+        self.block_lru: Dict[str, DeviceLRUBlocks] = {}
+
+        # load persisted LRU state if exists
+        try:
+            with open(LRU_STATE_PATH, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if isinstance(raw, dict):
+                for dev, st in raw.items():
+                    if isinstance(st, dict):
+                        self.block_lru[dev] = DeviceLRUBlocks.from_state(st)
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+            
         self.golden = golden_db
         self.devices: Dict[str, DeviceConn] = {}
         self.selected_device: Optional[str] = None
@@ -343,6 +377,14 @@ class VerifierServer:
                 fpa.close()
         except Exception:
             pass
+
+    def _save_lru_state(self):
+        try:
+            blob = {dev: lru.export_state() for dev, lru in self.block_lru.items()}
+            save_json_atomic(LRU_STATE_PATH, blob)
+        except Exception:
+            pass
+
 
     # -------- networking --------
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
@@ -596,6 +638,19 @@ class VerifierServer:
 
         while True:
             try:
+                # --- NEW: μην κάνεις GET_WINDOWS όταν τρέχει attestation ---
+                lk = self._attest_lock(dev)
+                if lk.locked():
+                    fp_evt = self.events_fp.get(dev)
+                    if fp_evt:
+                        self._jwrite(fp_evt, {
+                            "ts_ms": ts_ms(),
+                            "device": dev,
+                            "event": "collector_skip_attest_inflight",
+                        })
+                    await asyncio.sleep(period_ms / 1000.0)
+                    continue
+
                 since = int(self.last_seen.get(dev, 0))
 
                 t0 = time.perf_counter()
@@ -687,47 +742,95 @@ class VerifierServer:
                             "trusted_for_decision": (trust == TRUST_TRUSTED),
                             **w
                         })
-                # ---------------- ML inference + optional attestation trigger ----------------
+# ---------------- ML inference (ALL windows) + majority vote + optional attestation trigger ----------------
                 if self.policy is not None and windows:
-                    w_last = windows[-1]
+                    labels = []
+                    per_window = []  # για debug/logging
+                    ok_cnt = 0
 
-                    pred = self.policy.predict(dev, w_last)
-                    decision = self.policy.decide(pred.get("label"))
+                    for w in windows:
+                        pr = self.policy.predict(dev, w)
+                        per_window.append({
+                            "window_id": w.get("window_id"),
+                            "ok": pr.get("ok"),
+                            "reason": pr.get("reason"),
+                            "label": None if pr.get("label") is None else str(pr.get("label")),
+                        })
+                        if pr.get("ok") and pr.get("label") is not None:
+                            ok_cnt += 1
+                            labels.append(str(pr.get("label")))
 
-                    # log inference event
+                    majority_label = None
+                    label_counts = {}
+                    if labels:
+                        for lb in labels:
+                            label_counts[lb] = label_counts.get(lb, 0) + 1
+                        # majority
+                        majority_label = max(label_counts.items(), key=lambda kv: kv[1])[0]
+
+                    decision = self.policy.decide(majority_label)
+
+                    # optional: compute a simple "confidence" = majority fraction
+                    total = sum(label_counts.values()) if label_counts else 0
+                    majority_frac = (label_counts.get(majority_label, 0) / total) if total > 0 else 0.0
+
+                    # log inference event (batch)
                     if fp_evt:
                         self._jwrite(fp_evt, {
                             "ts_ms": ts_ms(),
                             "device": dev,
-                            "event": "ml_inference",
-                            "pred_ok": pred.get("ok"),
-                            "pred_reason": pred.get("reason"),
-                            "device_int": pred.get("device_int"),
-                            "label": str(pred.get("label")),
+                            "event": "ml_inference_batch",
+                            "n_windows": len(windows),
+                            "n_ok": ok_cnt,
+                            "label_counts": label_counts,
+                            "majority_label": majority_label,
+                            "majority_frac": round(majority_frac, 3),
                             "decision": decision,
-                            "window_id": w_last.get("window_id"),
+                            "window_id_range": {
+                                "from": windows[0].get("window_id"),
+                                "to": windows[-1].get("window_id"),
+                            },
+                            # Αν το θες, κράτα και per-window λεπτομέρεια (μπορεί να φουσκώσει το αρχείο)
+                            # "per_window": per_window,
                         })
-                    ml_meta = {
-                        "label": str(pred.get("label")),
-                        "decision": decision,
-                        "window_id": w_last.get("window_id"),
-                        "pred_ok": pred.get("ok"),
-                        "pred_reason": pred.get("reason"),
-                    }
 
-
-                    # optional: trigger attestation (cooldown to avoid spam)
+                    # optional: trigger attestation (cooldown + lock + majority)
                     if ML_TRIGGER_ATTEST:
-                        now_t = time.time()
-                        last_t = self.last_ml_trigger_ts.get(dev, 0.0)
+                        # Μην ξεκινάς νέο attestation αν τρέχει ήδη (lock)
+                        lk = self._attest_lock(dev)
+                        if lk.locked():
+                            if fp_evt:
+                                self._jwrite(fp_evt, {
+                                    "ts_ms": ts_ms(),
+                                    "device": dev,
+                                    "event": "ml_trigger_skip_inflight",
+                                    "majority_label": majority_label,
+                                    "decision": decision,
+                                })
+                        else:
+                            now_t = time.time()
+                            last_t = self.last_ml_trigger_ts.get(dev, 0.0)
 
-                        if now_t - last_t >= ML_COOLDOWN_S:
-                            self.last_ml_trigger_ts[dev] = now_t
-                            if decision.get("action") == "FULL":
-                                asyncio.create_task(self.attest_full_and_log(dev, trigger="ML", ml=ml_meta))
-                            elif decision.get("action") == "PARTIAL":
-                                k = int(decision.get("k", 3))
-                                asyncio.create_task(self.attest_partial_and_log(dev, k=k, trigger="ML", ml=ml_meta))
+                            if now_t - last_t >= ML_COOLDOWN_S:
+                                self.last_ml_trigger_ts[dev] = now_t
+
+                                ml_meta = {
+                                    "majority_label": majority_label,
+                                    "label_counts": label_counts,
+                                    "majority_frac": round(majority_frac, 3),
+                                    "n_windows": len(windows),
+                                    "n_ok": ok_cnt,
+                                    "decision": decision,
+                                    "window_id_from": windows[0].get("window_id"),
+                                    "window_id_to": windows[-1].get("window_id"),
+                                }
+
+                                if decision.get("action") == "FULL":
+                                    asyncio.create_task(self.attest_full_and_log(dev, trigger="ML_MAJORITY", ml=ml_meta))
+                                elif decision.get("action") == "PARTIAL":
+                                    k = int(decision.get("k", 3))
+                                    asyncio.create_task(self.attest_partial_and_log(dev, k=k, trigger="ML_MAJORITY", ml=ml_meta))
+
             except Exception as e:
                 # αν ο loop σκάσει, μην πεθάνει. Γράψε το.
                 fp_evt = self.events_fp.get(dev)
@@ -805,21 +908,8 @@ class VerifierServer:
                 parts = cmd.split()
                 k = int(parts[1]) if len(parts) > 1 else 3
 
-                bc = self.get_block_count(dev)
-                if bc <= 0:
-                    print("No golden blocks yet. Run: provision_blocks")
-                    continue
+                coro = self.attest_partial_and_log(dev, k=k, trigger="CLI")
 
-                k = max(1, min(k, bc))
-                indices = sorted(random.sample(range(bc), k)) #always exactly k blocks 
-                nonce = secrets.token_hex(8)
-                coro = self.send_request_timed(dev, {
-                    "type": "ATTEST_REQUEST",
-                    "mode": "PARTIAL_BLOCKS",
-                    "region": "fw",
-                    "nonce": nonce,
-                    "indices": indices
-                }, timeout=12.0)
             elif cmd == "provision_golden":
                 coro = self.provision_golden_full(dev, region="fw")
             elif cmd == "force_provision_golden":
@@ -927,7 +1017,15 @@ class VerifierServer:
             return {"type": "ERROR", "reason": "no_golden_blocks"}
 
         k = max(1, min(int(k), bc))
-        indices = sorted(random.sample(range(bc), k))
+        #indices = sorted(random.sample(range(bc), k))
+        lru = self._get_block_lru(dev)
+        if lru is None:
+            return {"type": "ERROR", "reason": "no_golden_blocks"}
+
+        indices = lru.pick(k)
+        # προαιρετικά: keep sorted for nicer logs / deterministic order on wire
+        indices = sorted(indices)
+
         nonce = secrets.token_hex(8)
 
         resp = await self.send_request_timed(dev, {
@@ -954,7 +1052,14 @@ class VerifierServer:
             trust_before = dc.trust_state
             resp = await self.attest_partial_once(dev, k=k, timeout=12.0)
             self._update_trust_from_attest(dev, resp if isinstance(resp, dict) else {}, attempt=1)
-
+            #update lru 
+            if isinstance(resp, dict) and resp.get("verify_ok", False):
+                idxs = resp.get("_indices") or []
+                lru = self._get_block_lru(dev)
+                if lru is not None and idxs:
+                    lru.touch(idxs)
+                    self._save_lru_state()
+                
             trust_after = dc.trust_state if dev in self.devices else TRUST_UNKNOWN
             indices = resp.get("_indices") if isinstance(resp, dict) else None
             kk = resp.get("_k") if isinstance(resp, dict) else k
