@@ -34,28 +34,33 @@ class DeviceLRPolicy:
         return int(digits)
 
     def predict(self, device_id: str, window: Dict[str, Any]) -> Dict[str, Any]:
-        try:
-            dev_int = self._device_key(device_id)
-            model = self.models.get(dev_int)
-            if model is None:
-                return {"ok": False, "reason": f"no_model_for_device:{dev_int}", "label": None}
+            try:
+                dev_int = self._device_key(device_id)
+                model = self.models.get(dev_int)
+                if model is None:
+                    return {"ok": False, "reason": f"no_model_for_device:{dev_int}", "label": None}
 
-            x = np.array([[float(window[f]) for f in self.features]], dtype=np.float32)
-            label = model.predict(x)[0]
-            return {"ok": True, "reason": "ok", "label": label, "device_int": dev_int}
+                x = np.array([[float(window[f]) for f in self.features]], dtype=np.float32)
 
-        except Exception as e:
-            return {"ok": False, "reason": f"predict_error:{e}", "label": None}
+                # predicted label
+                pred = model.predict(x)[0]
 
-    def decide(self, label: Any) -> Dict[str, Any]:
-        if label is None:
-            return {"action": "FULL", "reason": "no_label_fallback_full"}
+                # try probabilities
+                proba = None
+                model_conf = None
+                if hasattr(model, "predict_proba"):
+                    p = model.predict_proba(x)[0]  # shape (n_classes,)
+                    proba = [float(v) for v in p.tolist()]
+                    model_conf = float(np.max(p))   # max class probability
 
-        try:
-            # handle numpy scalars, strings, etc.
-            if str(label) == "0":
-                return {"action": "PARTIAL", "k": 3, "reason": "label0_partial3"}
-            else:
-                return {"action": "FULL", "reason": f"label{label}_full"}
-        except Exception:
-            return {"action": "FULL", "reason": "decide_error_fallback_full"}
+                return {
+                    "ok": True,
+                    "reason": "ok",
+                    "label": pred,
+                    "device_int": dev_int,
+                    "proba": proba,           # list[float] or None
+                    "model_conf": model_conf  # float in [0,1] or None
+                }
+
+            except Exception as e:
+                return {"ok": False, "reason": f"predict_error:{e}", "label": None}
