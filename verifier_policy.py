@@ -55,15 +55,15 @@ class DevicePolicyState:
 
 
 @dataclass
-class PolicyConfig:
+class PolicyConfig: #οι κανόνες του scheduling 
     # GET_WINDOWS behavior by stable label
-    get_windows_period_s: Dict[Label, float] = field(default_factory=lambda: {
+    get_windows_period_s: Dict[Label, float] = field(default_factory=lambda: { #κάθε πότε ζητάμε windows
         Label.LIGHT: 0.5,       # συχνά
         Label.MEDIUM: 1.0,
         Label.HEAVY: 2.0,       # πιο αραιά
         Label.SUSPICIOUS: 0.5,  # συχνά για evidence
     })
-    get_windows_max: Dict[Label, int] = field(default_factory=lambda: {
+    get_windows_max: Dict[Label, int] = field(default_factory=lambda: {  #πόσα windows 
         Label.LIGHT: 12,
         Label.MEDIUM: 8,
         Label.HEAVY: 6,

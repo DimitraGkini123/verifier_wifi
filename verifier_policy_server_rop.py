@@ -11,10 +11,10 @@ from typing import Dict, Any, Optional
 
 from utils import save_json_atomic, jdump, sha256, ts_ms, now_s, unhex
 from lru_blocks import DeviceLRUBlocks
-from policy_device_lr import DeviceLRPolicy
+from policy_device_lr_rop import DeviceLRPolicy
 
 # NEW: policy engine that schedules GET_WINDOWS + ATTEST based on stable label
-from verifier_policy import PolicyEngine, Label as PLLabel, AttestKind as PLAttestKind
+from verifier_policy_with_rop import PolicyEngine, Label as PLLabel, AttestKind as PLAttestKind
 
 LRU_STATE_PATH = "lru_state.json"
 
@@ -27,7 +27,7 @@ TRUST_TRUSTED = "TRUSTED"
 TRUST_UNTRUSTED = "UNTRUSTED"
 
 # ---------------- ML / Policy config ----------------
-MODEL_PATH = "models/verifier_models_per_device.joblib"
+MODEL_PATH = "models/device_1_safe_rop.joblib"
 ML_ENABLE = True
 
 # Policy hysteresis: πόσες φορές πρέπει να δεις majority διαφορετικό για να αλλάξεις stable label
@@ -482,28 +482,19 @@ class VerifierPolicyServer:
     # ----------------- policy loop (NEW) -----------------
     @staticmethod
     def _map_model_label_to_policy_label(x) -> PLLabel:
-        """
-        Your LR model likely returns:
-          0=LIGHT, 1=MEDIUM, 2=HEAVY, 3=SUSPICIOUS
-        But we accept strings too.
-        """
+        # model returns strings: light_safe/medium_safe/heavy_safe/light_rop/heavy_rop
+        s = str(x).strip()
         try:
-            if isinstance(x, int):
-                return {0: PLLabel.LIGHT, 1: PLLabel.MEDIUM, 2: PLLabel.HEAVY, 3: PLLabel.SUSPICIOUS}.get(x, PLLabel.MEDIUM)
-            s = str(x).strip().upper()
-            if s.isdigit():
-                return {0: PLLabel.LIGHT, 1: PLLabel.MEDIUM, 2: PLLabel.HEAVY, 3: PLLabel.SUSPICIOUS}.get(int(s), PLLabel.MEDIUM)
-            if "SUSP" in s:
-                return PLLabel.SUSPICIOUS
-            if "HEAV" in s:
-                return PLLabel.HEAVY
-            if "LIGHT" in s:
-                return PLLabel.LIGHT
-            if "MED" in s:
-                return PLLabel.MEDIUM
+            return {
+                "light_safe": PLLabel.LIGHT_SAFE,
+                "medium_safe": PLLabel.MEDIUM_SAFE,
+                "heavy_safe": PLLabel.HEAVY_SAFE,
+                "light_rop": PLLabel.LIGHT_ROP,
+                "heavy_rop": PLLabel.HEAVY_ROP,
+            }.get(s, PLLabel.SUSPICIOUS)
         except Exception:
-            pass
-        return PLLabel.MEDIUM
+            return PLLabel.SUSPICIOUS
+
 
     async def policy_loop(self, dev: str):
         self._open_files_for(dev)
@@ -589,59 +580,78 @@ class VerifierPolicyServer:
                                 })
 
                         # 2) ML inference on ALL windows -> majority vote -> update policy
+                                                # 2) ML inference on ALL windows -> (weighted) vote -> update policy
                         if self.lr_policy is not None and windows:
                             labels_for_policy: list[PLLabel] = []
                             label_counts: Dict[str, int] = {}
                             ok_cnt = 0
 
-                            labels_for_policy: list[PLLabel] = []
-                            label_counts: Dict[str, int] = {}
-                            ok_cnt = 0
-
-                            # NEW: weighted voting
                             weighted_scores: Dict[str, float] = {}   # label -> sum(weight)
-                            conf_values: list[float] = []            # model_conf per window
-                            per_window_debug = []                    # optional: keep small debug info
+                            conf_values: list[float] = []
+                            rop_scores: list[float] = []
+
+                            # OPTIONAL: labels that come from prover windows (if your windows include it)
+                            prover_counts: Dict[str, int] = {}
 
                             for w in windows:
+                                # if prover already includes a label field in the window, log it too
+                                pl_from_prover = w.get("label")
+                                if pl_from_prover is not None:
+                                    ps = str(pl_from_prover)
+                                    prover_counts[ps] = prover_counts.get(ps, 0) + 1
+
                                 pr = self.lr_policy.predict(dev, w)
                                 if pr.get("ok") and pr.get("label") is not None:
                                     ok_cnt += 1
                                     pl = self._map_model_label_to_policy_label(pr["label"])
                                     labels_for_policy.append(pl)
+
                                     label_counts[pl.value] = label_counts.get(pl.value, 0) + 1
 
-                                    # weight = model_conf if available else 1.0
+                                    # weight by model confidence if available else 1.0
                                     wc = pr.get("model_conf")
                                     wgt = float(wc) if wc is not None else 1.0
                                     weighted_scores[pl.value] = weighted_scores.get(pl.value, 0.0) + wgt
                                     if wc is not None:
                                         conf_values.append(float(wc))
 
-                                    # optional tiny debug (won’t explode file)
-                                    per_window_debug.append({
-                                        "window_id": w.get("window_id"),
-                                        "label": pl.value,
-                                        "model_conf": wc
-                                    })
-                            # NEW: weighted majority label (based on sum of confidences)
-                                weighted_majority = None
-                                weighted_conf = 0.0
-                                total_weight = sum(weighted_scores.values()) if weighted_scores else 0.0
-                                if weighted_scores:
-                                    weighted_majority, best_w = max(weighted_scores.items(), key=lambda kv: kv[1])
-                                    weighted_conf = (best_w / total_weight) if total_weight > 0 else 0.0
+                                    # rop score (P(light_rop)+P(heavy_rop))
+                                    rs = pr.get("rop_score")
+                                    if rs is not None:
+                                        rop_scores.append(float(rs))
 
-                                # model confidence summary (not policy)
-                                model_conf_avg = (sum(conf_values) / len(conf_values)) if conf_values else None
-                                model_conf_min = (min(conf_values)) if conf_values else None
-                                model_conf_max = (max(conf_values)) if conf_values else None
+                            # weighted majority
+                            weighted_majority = None
+                            weighted_conf = None
+                            if weighted_scores:
+                                total_weight = sum(weighted_scores.values())
+                                weighted_majority, best_w = max(weighted_scores.items(), key=lambda kv: kv[1])
+                                weighted_conf = (best_w / total_weight) if total_weight > 0 else 0.0
+                                weighted_majority = self._map_model_label_to_policy_label(weighted_majority)
 
+                            model_conf_avg = (sum(conf_values) / len(conf_values)) if conf_values else None
+                            model_conf_min = min(conf_values) if conf_values else None
+                            model_conf_max = max(conf_values) if conf_values else None
+                            rop_score_avg = (sum(rop_scores) / len(rop_scores)) if rop_scores else None
 
-                            summ = self.policy.on_inference_batch(dev, labels_for_policy, now=time.time())
-                            decision = self.policy.tick(dev, now=time.time())
+                            # update policy with extra confidence info
+                            summ = self.policy.on_inference_batch(
+                                dev,
+                                labels_for_policy,
+                                now=time.time(),
+                                weighted_majority=weighted_majority,
+                                weighted_confidence=weighted_conf,
+                                model_conf_avg=model_conf_avg,
+                                model_conf_min=model_conf_min,
+                                model_conf_max=model_conf_max,
+                                rop_score_avg=rop_score_avg,
+                            )
+
                             majority = summ.majority.value
                             conf = float(summ.confidence)
+
+                            # IMPORTANT: tick AFTER on_inference_batch (so new stable label affects scheduling)
+                            decision = self.policy.tick(dev, now=time.time())
 
                             if fp_evt:
                                 self._jwrite(fp_evt, {
@@ -651,15 +661,30 @@ class VerifierPolicyServer:
                                     "n_windows": len(windows),
                                     "n_ok": ok_cnt,
                                     "label_counts": label_counts,
+
                                     "majority_label": majority,
                                     "majority_frac": round(conf, 3),
+
+                                    "weighted_majority_label": (summ.weighted_majority.value if summ.weighted_majority else None),
+                                    "weighted_majority_frac": (round(float(summ.weighted_confidence), 3) if summ.weighted_confidence is not None else None),
+
+                                    "model_conf_avg": (round(float(model_conf_avg), 3) if model_conf_avg is not None else None),
+                                    "model_conf_min": (round(float(model_conf_min), 3) if model_conf_min is not None else None),
+                                    "model_conf_max": (round(float(model_conf_max), 3) if model_conf_max is not None else None),
+
+                                    "rop_score_avg": (round(float(rop_score_avg), 3) if rop_score_avg is not None else None),
+
                                     "policy_stable_label": self.policy.devices[dev].stable_label.value,
                                     "policy_reason": self.policy.devices[dev].last_reason,
+
+                                    "prover_label_counts": prover_counts if prover_counts else None,
+
                                     "window_id_range": {
                                         "from": windows[0].get("window_id"),
                                         "to": windows[-1].get("window_id"),
                                     },
                                 })
+
 
             # 3) ATTEST if due (policy-driven)
             if decision.attest_kind != PLAttestKind.NONE:
@@ -670,7 +695,17 @@ class VerifierPolicyServer:
                     "policy_last_majority": st.last_majority.value,
                     "policy_conf": round(float(st.last_confidence), 3),
                     "policy_reason": st.last_reason,
+
+                    "weighted_majority": (st.last_weighted_majority.value if st.last_weighted_majority else None),
+                    "weighted_conf": (round(float(st.last_weighted_conf), 3) if st.last_weighted_conf is not None else None),
+
+                    "model_conf_avg": (round(float(st.last_model_conf_avg), 3) if st.last_model_conf_avg is not None else None),
+                    "model_conf_min": (round(float(st.last_model_conf_min), 3) if st.last_model_conf_min is not None else None),
+                    "model_conf_max": (round(float(st.last_model_conf_max), 3) if st.last_model_conf_max is not None else None),
+
+                    "rop_score_avg": (round(float(st.last_rop_score_avg), 3) if st.last_rop_score_avg is not None else None),
                 }
+
 
                 if decision.attest_kind == PLAttestKind.FULL:
                     asyncio.create_task(self.attest_full_and_log(dev, trigger="POLICY", ml=ml_meta))
