@@ -10,7 +10,7 @@ import threading
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, Any, Optional, List, Tuple
-
+import math
 from utils import save_json_atomic, jdump, sha256, ts_ms, now_s, unhex
 from lru_blocks import DeviceLRUBlocks
 from policy_device_lr import DeviceLRPolicy
@@ -30,6 +30,12 @@ LOG_DIR = "logs"
 TRUST_UNKNOWN = "UNKNOWN"
 TRUST_TRUSTED = "TRUSTED"
 TRUST_UNTRUSTED = "UNTRUSTED"
+
+AUTO_PROVISION_ON_REGISTER = True
+AUTO_PROVISION_BLOCKS_TOO = True   # αν θες και blocks
+AUTO_PROVISION_FORCE = False       # ΜΗΝ το κάνεις True εκτός αν θες overwrite
+AUTO_PROVISION_DELAY_S = 0.3
+
 
 #quarantine configs 
 QUARANTINE_ON_FULL_FAILS = 2          # trigger after 2 consecutive FULL failures
@@ -247,13 +253,128 @@ class VerifierPolicyServer:
         self.policy_tasks: Dict[str, asyncio.Task] = {}
 
         # Budget (from budget_config.json)
-        per_dev_budget, per_dev_min_k = self._load_budget_config(BUDGET_CFG_PATH)
+        per_dev_budget, per_dev_min_k, dev_level, level_cov = self._load_budget_config(BUDGET_CFG_PATH)
         self.device_min_k: Dict[str, int] = per_dev_min_k
+        self.device_level = dev_level                 # NEW: dev -> level_name
+        self.level_coverage = level_cov               # NEW: level_name -> {Label -> float}
 
         self.budget = BudgetManager(
             default_cfg=BudgetConfig(per_min_units=50, cap_units=50, min_k=1),
             per_device_cfg=per_dev_budget
         )
+
+                # ---- Device capabilities from HELLO ----
+        self.device_caps_path = "device_caps.json"
+        self.device_caps: Dict[str, Dict[str, int]] = {}
+        self._load_device_caps()
+
+    def _load_device_caps(self):
+        try:
+            with open(self.device_caps_path, "r", encoding="utf-8") as f:
+                self.device_caps = json.load(f) or {}
+        except FileNotFoundError:
+            self.device_caps = {}
+        except Exception:
+            self.device_caps = {}
+
+    def _save_device_caps(self):
+        try:
+            save_json_atomic(self.device_caps_path, self.device_caps)
+        except Exception:
+            pass
+
+    def _caps(self, dev: str) -> Dict[str, int]:
+        # defaults if not known
+        c = self.device_caps.get(dev) or {}
+        fw_blocks_n = int(c.get("fw_blocks_n", 0) or 0)
+        max_req_blocks = int(c.get("max_req_blocks", 32) or 32)
+        if max_req_blocks <= 0:
+            max_req_blocks = 32
+        return {"fw_blocks_n": fw_blocks_n, "max_req_blocks": max_req_blocks}
+
+    
+
+    def has_golden_full(self, device_id: str, region: str = "fw") -> bool:
+        try:
+            _ = self.golden[device_id][region]["sha256"]
+            return True
+        except Exception:
+            return False
+
+    async def auto_provision_on_register(self, dev: str):
+        await asyncio.sleep(AUTO_PROVISION_DELAY_S)
+
+        if dev not in self.devices:
+            return
+
+        fp_evt = self.events_fp.get(dev)
+        if fp_evt:
+            self._jwrite(fp_evt, {"ts_ms": ts_ms(), "device": dev, "event": "auto_provision_check_start"})
+
+        # ---- FULL golden ----
+        if not self.has_golden_full(dev, region="fw"):
+            if fp_evt:
+                self._jwrite(fp_evt, {"ts_ms": ts_ms(), "device": dev, "event": "auto_provision_full_start"})
+
+            # IMPORTANT: για provisioning θέλεις απάντηση με fw_hash_hex.
+            # Αυτό προϋποθέτει ότι ο prover στο FULL_HASH_PROVER στέλνει fw_hash_hex.
+            # (όπως στην παλιά σου έκδοση)
+            if AUTO_PROVISION_FORCE:
+                resp = await self.force_provision_golden_full(dev, region="fw")
+            else:
+                resp = await self.provision_golden_full(dev, region="fw")  # θα το ορίσεις ακριβώς όπως πριν
+
+            if fp_evt:
+                self._jwrite(fp_evt, {"ts_ms": ts_ms(), "device": dev, "event": "auto_provision_full_done", "resp": resp})
+
+            if not isinstance(resp, dict) or resp.get("type") != "OK":
+                return  # μη συνεχίσεις σε blocks αν απέτυχε το full provisioning
+
+        # ---- BLOCKS golden (optional) ----
+        if AUTO_PROVISION_BLOCKS_TOO and (not self.has_golden_blocks(dev)):
+            if fp_evt:
+                self._jwrite(fp_evt, {"ts_ms": ts_ms(), "device": dev, "event": "auto_provision_blocks_start"})
+
+            resp2 = await self.provision_golden_blocks(dev, force=AUTO_PROVISION_FORCE)
+
+            if fp_evt:
+                self._jwrite(fp_evt, {"ts_ms": ts_ms(), "device": dev, "event": "auto_provision_blocks_done", "resp": resp2})
+
+        # ---- sanity FULL attest μετά το provisioning ----
+        if fp_evt:
+            self._jwrite(fp_evt, {"ts_ms": ts_ms(), "device": dev, "event": "auto_provision_sanity_full_attest_start"})
+
+        resp3 = await self.attest_full_and_log(dev, trigger="AUTO_PROVISION_SANITY", ml={"policy_reason": "auto_provision_sanity"})
+
+        if fp_evt:
+            self._jwrite(fp_evt, {
+                "ts_ms": ts_ms(),
+                "device": dev,
+                "event": "auto_provision_sanity_full_attest_done",
+                "verify_ok": (resp3.get("verify_ok") if isinstance(resp3, dict) else False),
+                "verify_reason": (resp3.get("verify_reason") if isinstance(resp3, dict) else "bad_resp")
+            })
+
+    async def provision_golden_full(self, dev: str, region: str = "fw") -> dict:
+        if self.has_golden_full(dev, region):
+            return {"type": "ERROR", "reason": "golden_already_exists_refusing_overwrite", "device": dev, "region": region}
+
+        nonce = secrets.token_hex(8)
+        resp = await self.send_request(dev, {
+            "type": "ATTEST_REQUEST",
+            "mode": "FULL_HASH_PROVER",
+            "region": region,
+            "nonce": nonce
+        }, timeout=12.0)
+
+        fw_hex = resp.get("fw_hash_hex")
+        if not fw_hex:
+            return {"type": "ERROR", "reason": "missing_fw_hash_hex_in_response", "resp": resp}
+
+        self.set_golden_full_hash(dev, region, fw_hex)
+        return {"type": "OK", "event": "golden_provisioned", "device": dev, "region": region, "fw_hash_hex": fw_hex}
+
+
     # ----------------- quarantine -----------------
     def _enter_quarantine(self, dev: str, reason: str):
         dc = self.devices.get(dev)
@@ -373,22 +494,38 @@ class VerifierPolicyServer:
 
 
     # ----------------- budget config loader -----------------
-    def _load_budget_config(self, path: str) -> Tuple[Dict[str, BudgetConfig], Dict[str, int]]:
+    def _load_budget_config(self, path: str) -> Tuple[Dict[str, BudgetConfig], Dict[str, int], Dict[str, str], Dict[str, Dict[PLLabel, float]]]:
         per_device_budget: Dict[str, BudgetConfig] = {}
         per_device_min_k: Dict[str, int] = {}
+        device_level: Dict[str, str] = {}  # NEW
+        level_coverage: Dict[str, Dict[PLLabel, float]] = {}  # NEW
 
         try:
             with open(path, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
         except FileNotFoundError:
             print(f"[{now_s()}] [BUDGET] No {path} found. Using defaults.")
-            return per_device_budget, per_device_min_k
+            return per_device_budget, per_device_min_k, device_level, level_coverage
         except Exception as e:
             print(f"[{now_s()}] [BUDGET] Failed to load {path}: {e}. Using defaults.")
-            return per_device_budget, per_device_min_k
+            return per_device_budget, per_device_min_k, device_level, level_coverage
 
         levels = cfg.get("levels", {}) or {}
         devices = cfg.get("devices", {}) or {}
+
+        # parse per-level coverage maps (optional)
+        for lvl_name, lvl in levels.items():
+            cov_raw = (lvl or {}).get("coverage", {}) or {}
+            cov_map: Dict[PLLabel, float] = {}
+            for k, v in cov_raw.items():
+                try:
+                    lb = PLLabel(str(k).strip().upper())
+                    fv = float(v)
+                    cov_map[lb] = max(0.0, min(1.0, fv))
+                except Exception:
+                    pass
+            if cov_map:
+                level_coverage[lvl_name] = cov_map
 
         for dev, level_name in devices.items():
             lvl = levels.get(level_name, {}) or {}
@@ -398,9 +535,11 @@ class VerifierPolicyServer:
 
             per_device_budget[dev] = BudgetConfig(per_min_units=per_min, cap_units=cap, min_k=max(1, min_k))
             per_device_min_k[dev] = max(1, min_k)
+            device_level[dev] = str(level_name)
 
         print(f"[{now_s()}] [BUDGET] loaded {len(per_device_budget)} device budgets from {path}")
-        return per_device_budget, per_device_min_k
+        return per_device_budget, per_device_min_k, device_level, level_coverage
+
 
     # ----------------- file helpers -----------------
     def _open_files_for(self, dev: str):
@@ -473,7 +612,12 @@ class VerifierPolicyServer:
         if self.has_golden_blocks(dev) and not force:
             return {"type": "ERROR", "reason": "golden_blocks_already_exists_refusing_overwrite", "device": dev}
 
-        # 1) Probe (ζήτα 1 block) για να πάρεις metadata
+        caps = self._caps(dev)
+        max_req = int(caps.get("max_req_blocks", 32) or 32)
+        if max_req <= 0:
+            max_req = 32
+
+        # 1) Probe: ζήτα 1 block (όχι empty list!) για να πάρεις metadata
         nonce = secrets.token_hex(8)
         probe = await self.send_request(dev, {
             "type": "ATTEST_REQUEST",
@@ -491,33 +635,63 @@ class VerifierPolicyServer:
         # accept either "block_size" or infer from first block's "len"
         block_size = int(probe.get("block_size", 0) or 0)
         if block_size <= 0:
-            blocks0 = probe.get("blocks", [])
+            blocks0 = probe.get("blocks", []) or []
             if blocks0 and isinstance(blocks0, list):
                 block_size = int(blocks0[0].get("len", 0) or 0)
 
         if block_size <= 0 or block_count <= 0:
             return {"type": "ERROR", "reason": "missing_block_meta", "resp": probe}
 
+        # sanity: αν HELLO είπε fw_blocks_n, χρησιμοποίησέ το μόνο για debug
+        fw_blocks_n_hello = int(caps.get("fw_blocks_n", 0) or 0)
+        if fw_blocks_n_hello and fw_blocks_n_hello != block_count:
+            # δεν το κάνουμε hard error, απλά ενημερωτικό
+            fp_evt = self.events_fp.get(dev)
+            if fp_evt:
+                self._jwrite(fp_evt, {
+                    "ts_ms": ts_ms(),
+                    "device": dev,
+                    "event": "blocks_meta_mismatch",
+                    "hello_fw_blocks_n": fw_blocks_n_hello,
+                    "prover_block_count": block_count
+                })
 
-        # 2) Ζήτα ΟΛΑ τα blocks
-        nonce = secrets.token_hex(8)
-        indices = list(range(block_count))
-        resp = await self.send_request(dev, {
-            "type": "ATTEST_REQUEST",
-            "mode": "PARTIAL_BLOCKS",
-            "region": "fw",
-            "nonce": nonce,
-            "indices": indices
-        }, timeout=30.0)
+        # 2) Ζήτα blocks σε batches των max_req μέχρι να τα πάρεις όλα
+        got: Dict[int, str] = {}
 
-        if resp.get("type") != "ATTEST_RESPONSE" or resp.get("mode") != "PARTIAL_BLOCKS":
-            return {"type": "ERROR", "reason": "bad_blocks_response", "resp": resp}
+        for start in range(0, block_count, max_req):
+            end = min(block_count, start + max_req)
+            chunk = list(range(start, end))
 
-        blocks = resp.get("blocks", [])
-        got = {}
-        for b in blocks:
-            if "index" in b and "hash_hex" in b:
-                got[int(b["index"])] = b["hash_hex"]
+            nonce = secrets.token_hex(8)
+            resp = await self.send_request(dev, {
+                "type": "ATTEST_REQUEST",
+                "mode": "PARTIAL_BLOCKS",
+                "region": "fw",
+                "nonce": nonce,
+                "indices": chunk
+            }, timeout=20.0)
+
+            if resp.get("type") != "ATTEST_RESPONSE" or resp.get("mode") != "PARTIAL_BLOCKS":
+                return {"type": "ERROR", "reason": "bad_blocks_response", "resp": resp, "range": [start, end]}
+
+            blocks = resp.get("blocks", []) or []
+            for b in blocks:
+                if "index" in b and "hash_hex" in b:
+                    got[int(b["index"])] = b["hash_hex"]
+
+            # optional progress log
+            fp_evt = self.events_fp.get(dev)
+            if fp_evt:
+                self._jwrite(fp_evt, {
+                    "ts_ms": ts_ms(),
+                    "device": dev,
+                    "event": "provision_blocks_progress",
+                    "got": len(got),
+                    "need": block_count,
+                    "last_range": [start, end],
+                    "max_req_blocks": max_req
+                })
 
         if len(got) < block_count:
             return {"type": "ERROR", "reason": "missing_some_blocks", "got": len(got), "need": block_count}
@@ -534,8 +708,10 @@ class VerifierPolicyServer:
             "event": "golden_blocks_provisioned" if not force else "golden_blocks_overwritten",
             "device": dev,
             "block_size": block_size,
-            "block_count": block_count
+            "block_count": block_count,
+            "max_req_blocks": max_req
         }
+
 
     # ----------------- LRU persistence -----------------
     def _load_lru_state(self):
@@ -1034,14 +1210,20 @@ class VerifierPolicyServer:
             pass
         return PLLabel.MEDIUM
 
+
     async def policy_loop(self, dev: str):
+        while dev in self.devices and (not self.has_golden_full(dev, "fw")):
+            await asyncio.sleep(0.2)
+           # αν έφυγε το device όσο περίμενες
+        if dev not in self.devices:
+            return
         self._open_files_for(dev)
         fp_evt = self.events_fp.get(dev)
 
         # initial full attest (optional) - bypass budget (it's provisioning / baseline)
-        if DO_INITIAL_FULL_ATTEST:
+        if DO_INITIAL_FULL_ATTEST and self.has_golden_full(dev, "fw"):
             await asyncio.sleep(0.5)
-            if dev in self.devices:
+            if dev in self.devices and self.has_golden_full(dev, "fw"):
                 if fp_evt:
                     self._jwrite(fp_evt, {"ts_ms": ts_ms(), "device": dev, "event": "initial_full_attest_start"})
                 await self.attest_full_and_log(dev, trigger="INITIAL")
@@ -1052,7 +1234,8 @@ class VerifierPolicyServer:
 
             now = time.time()
             dc = self.devices.get(dev)   # <-- ΠΡΕΠΕΙ να υπάρχει, αλλιώς dc is undefined
-
+            if not dc:
+                return
 
             # tick policy
             decision = self.policy.tick(dev, now=now)
@@ -1247,13 +1430,37 @@ class VerifierPolicyServer:
                     "policy_reason": st.last_reason if st else None,
                 }
 
-                # Ideal plan from policy
                 if decision.attest_kind == PLAttestKind.FULL:
                     ideal_kind = "FULL"
                     ideal_k = 0
+                    cov_used = None
                 else:
                     ideal_kind = "PARTIAL"
-                    ideal_k = int(decision.k)
+
+                    # stable label from policy state (server-side truth)
+                    st = self.policy.devices.get(dev)
+                    stable_lb = st.stable_label if st else PLLabel.MEDIUM
+
+                    # device level from config
+                    level = getattr(self, "device_level", {}).get(dev, "normal")
+
+                    # coverage from level (if exists) else fallback to decision.coverage from policy
+                    cov = None
+                    lvl_cov = getattr(self, "level_coverage", {}).get(level, {})
+                    if lvl_cov and stable_lb in lvl_cov:
+                        cov = float(lvl_cov[stable_lb])
+                    else:
+                        cov = float(getattr(decision, "coverage", 0.0) or 0.0)
+
+                    cov = max(0.0, min(1.0, cov))
+                    cov_used = cov
+
+                    real_bc = self.get_block_count(dev)
+                    if real_bc > 0:
+                        ideal_k = max(1, min(real_bc, int(math.ceil(cov * real_bc))))
+                    else:
+                        ideal_k = 0
+
 
                 real_bc = self.get_block_count(dev)
                 min_k = int(self.device_min_k.get(dev, 1))
@@ -1273,6 +1480,17 @@ class VerifierPolicyServer:
                 # If partial selected but no blocks exist, force NONE (avoid pointless scheduling)
                 if fit_kind == "PARTIAL" and real_bc <= 0:
                     fit_kind, fit_k, cost_units, budget_reason = ("NONE", 0, 0, "no_golden_blocks_for_partial")
+                
+                level = getattr(self, "device_level", {}).get(dev, "normal")
+
+                # target coverage που χρησιμοποίησες (μόνο για PARTIAL)
+                target_cov = cov_used if (ideal_kind == "PARTIAL") else None
+
+                # τι coverage βγήκε ιδανικά (με το ideal_k που υπολόγισες)
+                ideal_cov = (ideal_k / real_bc) if (ideal_kind == "PARTIAL" and real_bc > 0) else None
+
+                # τι coverage βγήκε τελικά (με fit_k μετά το budget degrade)
+                final_cov = (fit_k / real_bc) if (fit_kind == "PARTIAL" and real_bc > 0) else None
 
                 fp_evt = self.events_fp.get(dev)
                 if fp_evt:
@@ -1280,13 +1498,29 @@ class VerifierPolicyServer:
                         "ts_ms": ts_ms(),
                         "device": dev,
                         "event": "budget_gate",
-                        "ideal": {"kind": ideal_kind, "k": ideal_k},
-                        "fit": {"kind": fit_kind, "k": fit_k, "cost_units": cost_units},
+
+                        "device_level": level,
+
+                        "ideal": {
+                            "kind": ideal_kind,
+                            "k": ideal_k,
+                            "target_coverage": round(float(target_cov), 3) if target_cov is not None else None,
+                            "ideal_coverage": round(float(ideal_cov), 3) if ideal_cov is not None else None,
+                        },
+
+                        "fit": {
+                            "kind": fit_kind,
+                            "k": fit_k,
+                            "cost_units": cost_units,
+                            "final_coverage": round(float(final_cov), 3) if final_cov is not None else None,
+                        },
+
                         "min_k": min_k,
                         "block_count": real_bc,
                         "tokens_before": round(tokens_before, 3),
                         "reason": budget_reason,
                     })
+
 
                 if fit_kind != "NONE":
                     # Spend budget immediately (reserve) to avoid races
@@ -1309,6 +1543,11 @@ class VerifierPolicyServer:
                         ml_meta["budget_tokens_before"] = round(tokens_before, 3)
                         ml_meta["budget_fit_kind"] = fit_kind
                         ml_meta["budget_fit_k"] = int(fit_k)
+                        ml_meta["device_level"] = level
+                        ml_meta["target_coverage"] = round(float(target_cov), 3) if target_cov is not None else None
+                        ml_meta["ideal_coverage"] = round(float(ideal_cov), 3) if ideal_cov is not None else None
+                        ml_meta["final_coverage"] = round(float(final_cov), 3) if final_cov is not None else None
+
 
                         if fit_kind == "FULL":
                             asyncio.create_task(self.attest_full_and_log(dev, trigger="POLICY", ml=ml_meta))
@@ -1351,6 +1590,16 @@ class VerifierPolicyServer:
             return
 
         device_id = hello["device_id"]
+                # ---- store HELLO capabilities ----
+        fw_blocks_n = int(hello.get("fw_blocks_n", 0) or 0)
+        max_req_blocks = int(hello.get("max_req_blocks", 32) or 32)
+
+        self.device_caps[device_id] = {
+            "fw_blocks_n": fw_blocks_n,
+            "max_req_blocks": max_req_blocks,
+        }
+        self._save_device_caps()
+
         dc = DeviceConn(device_id=device_id, reader=reader, writer=writer)
         self.devices[device_id] = dc
         if self.selected_device is None:
@@ -1360,6 +1609,9 @@ class VerifierPolicyServer:
         fp_evt = self.events_fp.get(device_id)
         if fp_evt:
             self._jwrite(fp_evt, {"ts_ms": ts_ms(), "device": device_id, "event": "device_registered"})
+
+        if AUTO_PROVISION_ON_REGISTER:
+            asyncio.create_task(self.auto_provision_on_register(device_id))
 
         # Start policy loop
         if device_id not in self.policy_tasks or self.policy_tasks[device_id].done():

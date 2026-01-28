@@ -29,5 +29,10 @@
         "7700a24a8f4db297a7f59240a151dfdfbd1f73732a636331b4ea10bb2cfde1a2"
       ]
     }
+  },
+  "pico2w_2": {
+    "fw": {
+      "sha256": "95972c361c74dfeccae37a1e3f8f11e3cb0e6b2fb8860da8fc3d1a74260be08e"
+    }
   }
 }

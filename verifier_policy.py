@@ -24,7 +24,8 @@ class PolicyDecision:
     do_get_windows: bool = True
     get_windows_max: int = 6
     attest_kind: AttestKind = AttestKind.NONE
-    k: int = 0
+    #k: int = 0
+    coverage: float = 0.0  
     reason: str = ""
 
 
@@ -83,11 +84,13 @@ class PolicyConfig: #οι κανόνες του scheduling
         Label.HEAVY: AttestKind.PARTIAL,      # keep partial even on heavy (your earlier preference)
         Label.SUSPICIOUS: AttestKind.FULL,    # escalate
     })
-    partial_k: Dict[Label, int] = field(default_factory=lambda: {
-        Label.LIGHT: 8,       # μεγάλο k
-        Label.MEDIUM: 4,
-        Label.HEAVY: 2,       # μικρό k για “lightweight” attest
-        Label.SUSPICIOUS: 0,
+
+    #deault times (fall back an den uparxoun sto json oi swstes gia kapoia siskeuh)
+    partial_coverage: Dict[Label, float] = field(default_factory=lambda: {
+        Label.LIGHT: 0.60,
+        Label.MEDIUM: 0.40,
+        Label.HEAVY: 0.20,
+        Label.SUSPICIOUS: 0.80,  # not used if FULL, but safe fallback
     })
 
     # safety: minimum time between attest triggers
@@ -179,11 +182,12 @@ class PolicyEngine:
 
         # schedule ATTEST
         kind = AttestKind.NONE
-        k = 0
+        cov = 0.0
         if now >= st.next_attest_ts and now >= st.attest_cooldown_s:
             kind = self.cfg.attest_kind[lb]
             if kind == AttestKind.PARTIAL:
-                k = int(self.cfg.partial_k[lb])
+                cov = float(self.cfg.partial_coverage[lb])
+                cov = max(0.0, min(1.0, cov))
             st.next_attest_ts = now + float(self.cfg.attest_period_s[lb])
             st.attest_cooldown_s = now + float(self.cfg.min_attest_cooldown_s)
 
@@ -191,6 +195,6 @@ class PolicyEngine:
             do_get_windows=do_get,
             get_windows_max=gw_max,
             attest_kind=kind,
-            k=k,
+            coverage=cov,
             reason=st.last_reason
         )
