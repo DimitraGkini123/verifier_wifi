@@ -1,4 +1,4 @@
-# verifier_policy_server.py
+# verifier_policy_server_rop.py
 
 import asyncio
 import json
@@ -7,13 +7,15 @@ import time
 import random
 import threading
 from dataclasses import dataclass, field
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 from utils import save_json_atomic, jdump, sha256, ts_ms, now_s, unhex
 from lru_blocks import DeviceLRUBlocks
+
+# ROP-aware LR policy
 from policy_device_lr_rop import DeviceLRPolicy
 
-# NEW: policy engine that schedules GET_WINDOWS + ATTEST based on stable label
+# ROP-aware policy engine
 from verifier_policy_with_rop import PolicyEngine, Label as PLLabel, AttestKind as PLAttestKind
 
 LRU_STATE_PATH = "lru_state.json"
@@ -30,15 +32,17 @@ TRUST_UNTRUSTED = "UNTRUSTED"
 MODEL_PATH = "models/device_1_safe_rop.joblib"
 ML_ENABLE = True
 
-# Policy hysteresis: πόσες φορές πρέπει να δεις majority διαφορετικό για να αλλάξεις stable label
 POLICY_HYSTERESIS_N = 2
 
-# Safety jitter (μικρό) για να μη συγχρονίζονται πολλά devices (αν έχεις πολλά)
 LOOP_TICK_S = 0.20
 JITTER_S = 0.05
 
-# Initial full attestation on connect?
 DO_INITIAL_FULL_ATTEST = True
+
+# ---------------- AUTO GOLDEN PROVISION ----------------
+AUTO_PROVISION_GOLDEN_FULL = True
+AUTO_PROVISION_GOLDEN_BLOCKS = True
+AUTO_PROVISION_REGION = "fw"
 
 
 @dataclass
@@ -65,37 +69,27 @@ class DeviceConn:
 
 
 class VerifierPolicyServer:
-    def __init__(self, golden_db: dict): #φορτώνει golden hashes 
-        # Golden DB
+    def __init__(self, golden_db: dict):
         self.golden = golden_db
 
-        # Devices
         self.devices: Dict[str, DeviceConn] = {}
         self.selected_device: Optional[str] = None
         self.loop: Optional[asyncio.AbstractEventLoop] = None
 
-        # Per-device window cursor ("since")
         self.last_seen: Dict[str, int] = {}
 
-        # Files
         self.windows_fp: Dict[str, Any] = {}
         self.events_fp: Dict[str, Any] = {}
         self.attest_fp: Dict[str, Any] = {}
 
-        # Attestation locks (per device)
         self.attest_locks: Dict[str, asyncio.Lock] = {}
 
-        # LRU blocks for partial
         self.block_lru: Dict[str, DeviceLRUBlocks] = {}
         self._load_lru_state()
 
-        # ML model
         self.lr_policy = DeviceLRPolicy(MODEL_PATH) if ML_ENABLE else None
 
-        # NEW: Policy engine per server (keeps per-device state inside)
         self.policy = PolicyEngine(hysteresis_n=POLICY_HYSTERESIS_N, enable_get_windows=True)
-
-        # Per-device policy task
         self.policy_tasks: Dict[str, asyncio.Task] = {}
 
     # ----------------- file helpers -----------------
@@ -160,7 +154,7 @@ class VerifierPolicyServer:
         return lru
 
     # ----------------- locks -----------------
-    def _attest_lock(self, dev: str) -> asyncio.Lock:  #επιστρέφει per device lock ώστε να μην τρέχουν 2 attest ταυτόχρονα στο ίδιο device.
+    def _attest_lock(self, dev: str) -> asyncio.Lock:
         lk = self.attest_locks.get(dev)
         if lk is None:
             lk = asyncio.Lock()
@@ -192,6 +186,168 @@ class VerifierPolicyServer:
             return unhex(self.golden[device_id]["blocks"]["hashes"][index])
         except Exception:
             return None
+        # ----------------- golden write/provision -----------------
+    def has_golden_full(self, device_id: str, region: str = "fw") -> bool:
+        try:
+            _ = self.golden[device_id][region]["sha256"]
+            return True
+        except Exception:
+            return False
+
+    def set_golden_full_hash(self, device_id: str, region: str, fw_hash_hex: str):
+        if device_id not in self.golden:
+            self.golden[device_id] = {}
+        if region not in self.golden[device_id]:
+            self.golden[device_id][region] = {}
+        self.golden[device_id][region]["sha256"] = str(fw_hash_hex).lower()
+        save_json_atomic(GOLDEN_PATH, self.golden)
+
+    async def provision_golden_full(self, dev: str, region: str = "fw") -> dict:
+        # guard: don't overwrite
+        if self.has_golden_full(dev, region):
+            return {
+                "type": "ERROR",
+                "reason": "golden_already_exists_refusing_overwrite",
+                "device": dev,
+                "region": region,
+                "existing_sha256": self.golden.get(dev, {}).get(region, {}).get("sha256")
+            }
+
+        nonce = secrets.token_hex(8)
+        resp = await self.send_request_timed(dev, {
+            "type": "ATTEST_REQUEST",
+            "mode": "FULL_HASH_PROVER",
+            "region": region,
+            "nonce": nonce
+        }, timeout=12.0)
+
+        fw_hex = resp.get("fw_hash_hex") or resp.get("hash_hex")
+        if not fw_hex:
+            return {"type": "ERROR", "reason": "missing_fw_hash_hex_in_response", "resp": resp}
+
+        self.set_golden_full_hash(dev, region, fw_hex)
+        return {"type": "OK", "event": "golden_provisioned", "device": dev, "region": region, "fw_hash_hex": fw_hex}
+
+    async def force_provision_golden_full(self, dev: str, region: str = "fw") -> dict:
+        nonce = secrets.token_hex(8)
+        resp = await self.send_request_timed(dev, {
+            "type": "ATTEST_REQUEST",
+            "mode": "FULL_HASH_PROVER",
+            "region": region,
+            "nonce": nonce
+        }, timeout=12.0)
+
+        fw_hex = resp.get("fw_hash_hex") or resp.get("hash_hex")
+        if not fw_hex:
+            return {"type": "ERROR", "reason": "missing_fw_hash_hex_in_response", "resp": resp}
+
+        self.set_golden_full_hash(dev, region, fw_hex)
+        return {"type": "OK", "event": "golden_overwritten", "device": dev, "region": region, "fw_hash_hex": fw_hex}
+
+    def set_golden_blocks(self, device_id: str, block_size: int, hashes_hex: list[str], force: bool = False):
+        if device_id not in self.golden:
+            self.golden[device_id] = {}
+
+        if (not force) and self.has_golden_blocks(device_id):
+            raise RuntimeError("golden_blocks_already_exist_refusing_overwrite")
+
+        self.golden[device_id]["blocks"] = {
+            "block_size": int(block_size),
+            "block_count": int(len(hashes_hex)),
+            "hashes": [str(h).lower() for h in hashes_hex],
+        }
+        save_json_atomic(GOLDEN_PATH, self.golden)
+
+    async def provision_golden_blocks(self, dev: str, force: bool = False) -> dict:
+        if self.has_golden_blocks(dev) and not force:
+            return {"type": "ERROR", "reason": "golden_blocks_already_exists_refusing_overwrite", "device": dev}
+
+        # 1) probe for metadata
+        nonce = secrets.token_hex(8)
+        probe = await self.send_request_timed(dev, {
+            "type": "ATTEST_REQUEST",
+            "mode": "PARTIAL_BLOCKS",
+            "region": "fw",
+            "nonce": nonce,
+            "indices": [0]
+        }, timeout=12.0)
+
+        if probe.get("type") != "ATTEST_RESPONSE" or probe.get("mode") != "PARTIAL_BLOCKS":
+            return {"type": "ERROR", "reason": "bad_probe_response", "resp": probe}
+
+        block_count = int(probe.get("block_count", 0) or 0)
+        block_size = int(probe.get("block_size", 0) or 0)
+
+        if block_size <= 0:
+            blocks0 = probe.get("blocks", []) or []
+            if blocks0 and isinstance(blocks0, list):
+                block_size = int(blocks0[0].get("len", 0) or 0)
+
+        if block_size <= 0 or block_count <= 0:
+            return {"type": "ERROR", "reason": "missing_block_meta", "resp": probe}
+
+        # 2) fetch all blocks
+        nonce = secrets.token_hex(8)
+        indices = list(range(block_count))
+        resp = await self.send_request_timed(dev, {
+            "type": "ATTEST_REQUEST",
+            "mode": "PARTIAL_BLOCKS",
+            "region": "fw",
+            "nonce": nonce,
+            "indices": indices
+        }, timeout=30.0)
+
+        if resp.get("type") != "ATTEST_RESPONSE" or resp.get("mode") != "PARTIAL_BLOCKS":
+            return {"type": "ERROR", "reason": "bad_blocks_response", "resp": resp}
+
+        blocks = resp.get("blocks", []) or []
+        got = {}
+        for b in blocks:
+            if "index" in b and ("hash_hex" in b):
+                got[int(b["index"])] = b["hash_hex"]
+
+        if len(got) < block_count:
+            return {"type": "ERROR", "reason": "missing_some_blocks", "got": len(got), "need": block_count}
+
+        hashes = [got[i] for i in range(block_count)]
+
+        try:
+            self.set_golden_blocks(dev, block_size, hashes, force=force)
+        except RuntimeError as e:
+            return {"type": "ERROR", "reason": str(e)}
+
+        return {
+            "type": "OK",
+            "event": "golden_blocks_provisioned" if not force else "golden_blocks_overwritten",
+            "device": dev,
+            "block_size": block_size,
+            "block_count": block_count
+        }
+
+    async def auto_provision_if_needed(self, dev: str):
+        """
+        Called at startup per-device: if golden missing, fetch it once (no overwrite).
+        Uses attest lock so it doesn't collide with initial attestation / windows fetch.
+        """
+        fp_evt = self.events_fp.get(dev)
+
+        async with self._attest_lock(dev):
+            if dev not in self.devices:
+                return
+
+            if AUTO_PROVISION_GOLDEN_FULL and (not self.has_golden_full(dev, AUTO_PROVISION_REGION)):
+                if fp_evt:
+                    self._jwrite(fp_evt, {"ts_ms": ts_ms(), "device": dev, "event": "auto_provision_full_start"})
+                r = await self.provision_golden_full(dev, region=AUTO_PROVISION_REGION)
+                if fp_evt:
+                    self._jwrite(fp_evt, {"ts_ms": ts_ms(), "device": dev, "event": "auto_provision_full_done", "resp": r})
+
+            if AUTO_PROVISION_GOLDEN_BLOCKS and (not self.has_golden_blocks(dev)):
+                if fp_evt:
+                    self._jwrite(fp_evt, {"ts_ms": ts_ms(), "device": dev, "event": "auto_provision_blocks_start"})
+                r = await self.provision_golden_blocks(dev, force=False)
+                if fp_evt:
+                    self._jwrite(fp_evt, {"ts_ms": ts_ms(), "device": dev, "event": "auto_provision_blocks_done", "resp": r})
 
     # ----------------- logging attest -----------------
     def log_attest_event(
@@ -252,7 +408,7 @@ class VerifierPolicyServer:
     # ----------------- request send -----------------
     async def send_request(self, device_id: str, msg: dict, timeout: float = 5.0) -> dict:
         dc = self.devices.get(device_id)
-        if not dc or not dc.is_alive():  # αν δεν ειναι συνδεδεμένη η συσκευή
+        if not dc or not dc.is_alive():
             return {"type": "ERROR", "reason": "device_not_connected"}
 
         req_id = secrets.token_hex(8)
@@ -294,6 +450,7 @@ class VerifierPolicyServer:
             return received
 
         # FULL
+        # FULL
         if mode == "FULL_HASH_PROVER" and rtype == "ATTEST_RESPONSE":
             golden = self.golden_full_hash(device_id, region=sent.get("region", "fw"))
             if golden is None:
@@ -302,6 +459,20 @@ class VerifierPolicyServer:
                 return received
 
             nonce_hex = sent.get("nonce")
+
+            # 1) direct hash field (useful for provisioning/debug)
+            fw_hex = received.get("fw_hash_hex") or received.get("hash_hex")
+            if fw_hex:
+                try:
+                    got = unhex(fw_hex)
+                    ok = (got == golden)
+                    received["verify_ok"] = ok
+                    received["verify_reason"] = "direct_hash_match" if ok else "direct_hash_mismatch"
+                    return received
+                except Exception:
+                    pass
+
+            # 2) nonce-bound response
             if "response_hex" in received and nonce_hex:
                 nonce = unhex(nonce_hex)
                 expected = sha256(nonce + golden)
@@ -314,6 +485,7 @@ class VerifierPolicyServer:
             received["verify_ok"] = False
             received["verify_reason"] = "missing_hash_fields"
             return received
+
 
         # PARTIAL
         if mode == "PARTIAL_BLOCKS" and rtype == "ATTEST_RESPONSE":
@@ -459,7 +631,6 @@ class VerifierPolicyServer:
             resp = await self.attest_partial_once(dev, k=k, timeout=12.0)
             self._update_trust_from_attest(dev, resp if isinstance(resp, dict) else {}, attempt=1)
 
-            # touch LRU only if ok
             if isinstance(resp, dict) and resp.get("verify_ok", False):
                 idxs = resp.get("_indices") or []
                 lru = self._get_block_lru(dev)
@@ -479,45 +650,93 @@ class VerifierPolicyServer:
             )
             return resp
 
-    # ----------------- policy loop (NEW) -----------------
+    # ----------------- policy loop (ROP-aware) -----------------
     @staticmethod
     def _map_model_label_to_policy_label(x) -> PLLabel:
-        # model returns strings: light_safe/medium_safe/heavy_safe/light_rop/heavy_rop
-        s = str(x).strip()
+        """
+        Accepts strings like:
+          light_safe, medium_safe, heavy_safe, light_rop, heavy_rop, suspicious
+        Also tolerates LIGHT/MEDIUM/HEAVY (mapped to *_SAFE).
+        """
         try:
-            return {
-                "light_safe": PLLabel.LIGHT_SAFE,
-                "medium_safe": PLLabel.MEDIUM_SAFE,
-                "heavy_safe": PLLabel.HEAVY_SAFE,
-                "light_rop": PLLabel.LIGHT_ROP,
-                "heavy_rop": PLLabel.HEAVY_ROP,
-            }.get(s, PLLabel.SUSPICIOUS)
-        except Exception:
-            return PLLabel.SUSPICIOUS
+            if isinstance(x, PLLabel):
+                return x
 
+            # allow legacy int mapping (best-effort)
+            if isinstance(x, int):
+                return {
+                    0: PLLabel.LIGHT_SAFE,
+                    1: PLLabel.MEDIUM_SAFE,
+                    2: PLLabel.HEAVY_SAFE,
+                    3: PLLabel.SUSPICIOUS,
+                }.get(x, PLLabel.MEDIUM_SAFE)
+
+            s = str(x).strip().lower()
+
+            if "light_rop" in s or ("rop" in s and "light" in s):
+                return PLLabel.LIGHT_ROP
+            if "heavy_rop" in s or ("rop" in s and "heavy" in s):
+                return PLLabel.HEAVY_ROP
+
+            if "susp" in s:
+                return PLLabel.SUSPICIOUS
+
+            # safe labels
+            if "light_safe" in s or s == "light":
+                return PLLabel.LIGHT_SAFE
+            if "medium_safe" in s or s == "medium":
+                return PLLabel.MEDIUM_SAFE
+            if "heavy_safe" in s or s == "heavy":
+                return PLLabel.HEAVY_SAFE
+
+            # fallback heuristics
+            if "light" in s:
+                return PLLabel.LIGHT_SAFE
+            if "heavy" in s:
+                return PLLabel.HEAVY_SAFE
+            if "med" in s:
+                return PLLabel.MEDIUM_SAFE
+
+        except Exception:
+            pass
+        return PLLabel.MEDIUM_SAFE
 
     async def policy_loop(self, dev: str):
         self._open_files_for(dev)
         fp_evt = self.events_fp.get(dev)
 
-        # initial full attest (optional)
         if DO_INITIAL_FULL_ATTEST:
             await asyncio.sleep(0.5)
+
             if dev in self.devices:
-                if fp_evt:
-                    self._jwrite(fp_evt, {"ts_ms": ts_ms(), "device": dev, "event": "initial_full_attest_start"})
-                await self.attest_full_and_log(dev, trigger="INITIAL")
+                # 1) auto-provision goldens (NO overwrite) αν λείπουν
+                await self.auto_provision_if_needed(dev)
+
+                # 2) αν ακόμη δεν έχει golden full, μην κάνεις INITIAL attest (θα βγει UNKNOWN)
+                if not self.has_golden_full(dev, region="fw"):
+                    if fp_evt:
+                        self._jwrite(fp_evt, {
+                            "ts_ms": ts_ms(),
+                            "device": dev,
+                            "event": "initial_full_attest_skipped_no_golden",
+                        })
+                else:
+                    if fp_evt:
+                        self._jwrite(fp_evt, {
+                            "ts_ms": ts_ms(),
+                            "device": dev,
+                            "event": "initial_full_attest_start"
+                        })
+                    await self.attest_full_and_log(dev, trigger="INITIAL")
 
         while True:
             if dev not in self.devices:
                 return
 
-            # tick policy
             decision = self.policy.tick(dev, now=time.time())
 
             # 1) GET_WINDOWS if due
             if decision.do_get_windows:
-                # don't overlap GET_WINDOWS during attestation
                 lk = self._attest_lock(dev)
                 if lk.locked():
                     if fp_evt:
@@ -579,78 +798,63 @@ class VerifierPolicyServer:
                                     **w
                                 })
 
-                        # 2) ML inference on ALL windows -> majority vote -> update policy
-                                                # 2) ML inference on ALL windows -> (weighted) vote -> update policy
+                        # 2) ML inference (ROP-aware) -> update policy with rich stats
                         if self.lr_policy is not None and windows:
-                            labels_for_policy: list[PLLabel] = []
+                            labels_for_policy: List[PLLabel] = []
                             label_counts: Dict[str, int] = {}
                             ok_cnt = 0
 
-                            weighted_scores: Dict[str, float] = {}   # label -> sum(weight)
-                            conf_values: list[float] = []
-                            rop_scores: list[float] = []
-
-                            # OPTIONAL: labels that come from prover windows (if your windows include it)
-                            prover_counts: Dict[str, int] = {}
+                            weighted_scores: Dict[PLLabel, float] = {}
+                            conf_values: List[float] = []
+                            rop_values: List[float] = []
 
                             for w in windows:
-                                # if prover already includes a label field in the window, log it too
-                                pl_from_prover = w.get("label")
-                                if pl_from_prover is not None:
-                                    ps = str(pl_from_prover)
-                                    prover_counts[ps] = prover_counts.get(ps, 0) + 1
-
                                 pr = self.lr_policy.predict(dev, w)
                                 if pr.get("ok") and pr.get("label") is not None:
                                     ok_cnt += 1
                                     pl = self._map_model_label_to_policy_label(pr["label"])
                                     labels_for_policy.append(pl)
-
                                     label_counts[pl.value] = label_counts.get(pl.value, 0) + 1
 
-                                    # weight by model confidence if available else 1.0
                                     wc = pr.get("model_conf")
                                     wgt = float(wc) if wc is not None else 1.0
-                                    weighted_scores[pl.value] = weighted_scores.get(pl.value, 0.0) + wgt
+                                    weighted_scores[pl] = weighted_scores.get(pl, 0.0) + wgt
                                     if wc is not None:
                                         conf_values.append(float(wc))
 
-                                    # rop score (P(light_rop)+P(heavy_rop))
                                     rs = pr.get("rop_score")
                                     if rs is not None:
-                                        rop_scores.append(float(rs))
+                                        rop_values.append(float(rs))
 
-                            # weighted majority
-                            weighted_majority = None
-                            weighted_conf = None
+                            # weighted majority + weighted confidence
+                            weighted_majority: Optional[PLLabel] = None
+                            weighted_confidence: Optional[float] = None
                             if weighted_scores:
-                                total_weight = sum(weighted_scores.values())
-                                weighted_majority, best_w = max(weighted_scores.items(), key=lambda kv: kv[1])
-                                weighted_conf = (best_w / total_weight) if total_weight > 0 else 0.0
-                                weighted_majority = self._map_model_label_to_policy_label(weighted_majority)
+                                total_w = sum(weighted_scores.values())
+                                wmaj, best_w = max(weighted_scores.items(), key=lambda kv: kv[1])
+                                weighted_majority = wmaj
+                                weighted_confidence = (best_w / total_w) if total_w > 0 else 0.0
 
                             model_conf_avg = (sum(conf_values) / len(conf_values)) if conf_values else None
-                            model_conf_min = min(conf_values) if conf_values else None
-                            model_conf_max = max(conf_values) if conf_values else None
-                            rop_score_avg = (sum(rop_scores) / len(rop_scores)) if rop_scores else None
+                            model_conf_min = (min(conf_values)) if conf_values else None
+                            model_conf_max = (max(conf_values)) if conf_values else None
 
-                            # update policy with extra confidence info
+                            rop_score_avg = (sum(rop_values) / len(rop_values)) if rop_values else None
+
+                            # update policy with rich stats (ROP gating happens inside PolicyEngine)
                             summ = self.policy.on_inference_batch(
                                 dev,
                                 labels_for_policy,
                                 now=time.time(),
                                 weighted_majority=weighted_majority,
-                                weighted_confidence=weighted_conf,
+                                weighted_confidence=weighted_confidence,
                                 model_conf_avg=model_conf_avg,
                                 model_conf_min=model_conf_min,
                                 model_conf_max=model_conf_max,
-                                rop_score_avg=rop_score_avg,
+                                rop_score_avg=rop_score_avg
                             )
 
-                            majority = summ.majority.value
-                            conf = float(summ.confidence)
-
-                            # IMPORTANT: tick AFTER on_inference_batch (so new stable label affects scheduling)
+                            # refresh decision right away after label update
                             decision = self.policy.tick(dev, now=time.time())
 
                             if fp_evt:
@@ -662,11 +866,11 @@ class VerifierPolicyServer:
                                     "n_ok": ok_cnt,
                                     "label_counts": label_counts,
 
-                                    "majority_label": majority,
-                                    "majority_frac": round(conf, 3),
+                                    "majority_label": summ.majority.value,
+                                    "majority_frac": round(float(summ.confidence), 3),
 
-                                    "weighted_majority_label": (summ.weighted_majority.value if summ.weighted_majority else None),
-                                    "weighted_majority_frac": (round(float(summ.weighted_confidence), 3) if summ.weighted_confidence is not None else None),
+                                    "weighted_majority": (weighted_majority.value if weighted_majority else None),
+                                    "weighted_confidence": (round(float(weighted_confidence), 3) if weighted_confidence is not None else None),
 
                                     "model_conf_avg": (round(float(model_conf_avg), 3) if model_conf_avg is not None else None),
                                     "model_conf_min": (round(float(model_conf_min), 3) if model_conf_min is not None else None),
@@ -677,40 +881,49 @@ class VerifierPolicyServer:
                                     "policy_stable_label": self.policy.devices[dev].stable_label.value,
                                     "policy_reason": self.policy.devices[dev].last_reason,
 
-                                    "prover_label_counts": prover_counts if prover_counts else None,
-
                                     "window_id_range": {
                                         "from": windows[0].get("window_id"),
                                         "to": windows[-1].get("window_id"),
                                     },
                                 })
 
-
             # 3) ATTEST if due (policy-driven)
             if decision.attest_kind != PLAttestKind.NONE:
-                # build ml meta snapshot for logs
-                st = self.policy.devices.get(dev)
-                ml_meta = {
-                    "policy_stable_label": st.stable_label.value,
-                    "policy_last_majority": st.last_majority.value,
-                    "policy_conf": round(float(st.last_confidence), 3),
-                    "policy_reason": st.last_reason,
+                lk = self._attest_lock(dev)
+                if lk.locked():
+                    if fp_evt:
+                        self._jwrite(fp_evt, {
+                            "ts_ms": ts_ms(),
+                            "device": dev,
+                            "event": "policy_skip_attest_inflight",
+                            "attest_kind": str(decision.attest_kind),
+                            "reason": decision.reason
+                        })
+                else:
+                    st = self.policy.devices.get(dev)
+                    ml_meta = None
+                    if st is not None:
+                        ml_meta = {
+                            "policy_stable_label": st.stable_label.value,
+                            "policy_last_majority": st.last_majority.value,
+                            "policy_vote_conf": round(float(st.last_confidence), 3),
 
-                    "weighted_majority": (st.last_weighted_majority.value if st.last_weighted_majority else None),
-                    "weighted_conf": (round(float(st.last_weighted_conf), 3) if st.last_weighted_conf is not None else None),
+                            "policy_weighted_majority": (st.last_weighted_majority.value if st.last_weighted_majority else None),
+                            "policy_weighted_conf": (round(float(st.last_weighted_conf), 3) if st.last_weighted_conf is not None else None),
 
-                    "model_conf_avg": (round(float(st.last_model_conf_avg), 3) if st.last_model_conf_avg is not None else None),
-                    "model_conf_min": (round(float(st.last_model_conf_min), 3) if st.last_model_conf_min is not None else None),
-                    "model_conf_max": (round(float(st.last_model_conf_max), 3) if st.last_model_conf_max is not None else None),
+                            "policy_model_conf_avg": (round(float(st.last_model_conf_avg), 3) if st.last_model_conf_avg is not None else None),
+                            "policy_model_conf_min": (round(float(st.last_model_conf_min), 3) if st.last_model_conf_min is not None else None),
+                            "policy_model_conf_max": (round(float(st.last_model_conf_max), 3) if st.last_model_conf_max is not None else None),
 
-                    "rop_score_avg": (round(float(st.last_rop_score_avg), 3) if st.last_rop_score_avg is not None else None),
-                }
+                            "policy_rop_score_avg": (round(float(st.last_rop_score_avg), 3) if st.last_rop_score_avg is not None else None),
 
+                            "policy_reason": st.last_reason,
+                        }
 
-                if decision.attest_kind == PLAttestKind.FULL:
-                    asyncio.create_task(self.attest_full_and_log(dev, trigger="POLICY", ml=ml_meta))
-                elif decision.attest_kind == PLAttestKind.PARTIAL:
-                    asyncio.create_task(self.attest_partial_and_log(dev, k=int(decision.k), trigger="POLICY", ml=ml_meta))
+                    if decision.attest_kind == PLAttestKind.FULL:
+                        asyncio.create_task(self.attest_full_and_log(dev, trigger="POLICY", ml=ml_meta))
+                    elif decision.attest_kind == PLAttestKind.PARTIAL:
+                        asyncio.create_task(self.attest_partial_and_log(dev, k=int(decision.k), trigger="POLICY", ml=ml_meta))
 
             await asyncio.sleep(LOOP_TICK_S + random.random() * JITTER_S)
 
@@ -719,7 +932,6 @@ class VerifierPolicyServer:
         peer = writer.get_extra_info("peername")
         print(f"[{now_s()}] [+] Connection from {peer}")
 
-        # Expect HELLO
         try:
             line = await asyncio.wait_for(reader.readline(), timeout=5.0)
         except asyncio.TimeoutError:
@@ -758,25 +970,20 @@ class VerifierPolicyServer:
         if fp_evt:
             self._jwrite(fp_evt, {"ts_ms": ts_ms(), "device": device_id, "event": "device_registered"})
 
-        # Start policy loop
         if device_id not in self.policy_tasks or self.policy_tasks[device_id].done():
             self.policy_tasks[device_id] = asyncio.create_task(self.policy_loop(device_id))
             print(f"[{now_s()}] [POLICY] started for {device_id}")
 
-        # Start RX loop
         try:
             await self.rx_loop(dc)
         finally:
-            # stop policy loop
             task = self.policy_tasks.get(device_id)
             if task and not task.done():
                 task.cancel()
             self.policy_tasks.pop(device_id, None)
 
-            # close files
             self._close_files_for(device_id)
 
-            # cleanup registry
             if self.devices.get(device_id) is dc:
                 del self.devices[device_id]
                 if self.selected_device == device_id:
@@ -786,13 +993,18 @@ class VerifierPolicyServer:
             await writer.wait_closed()
             print(f"[{now_s()}] [x] Disconnected device_id={device_id}")
 
-    # ----------------- optional CLI (same idea as before) -----------------
+    # ----------------- optional CLI -----------------
     def cli_thread(self):
         print("\nCLI commands:")
         print("  list")
         print("  use <device_id>")
         print("  ping")
+        print("  provision_golden")
+        print("  force_provision_golden")
+        print("  provision_blocks")
+        print("  force_provision_blocks")
         print("  quit\n")
+
 
         while True:
             try:
@@ -830,9 +1042,18 @@ class VerifierPolicyServer:
 
             if cmd == "ping":
                 coro = self.send_request(dev, {"type": "PING"})
+            elif cmd == "provision_golden":
+                coro = self.provision_golden_full(dev, region="fw")
+            elif cmd == "force_provision_golden":
+                coro = self.force_provision_golden_full(dev, region="fw")
+            elif cmd == "provision_blocks":
+                coro = self.provision_golden_blocks(dev, force=False)
+            elif cmd == "force_provision_blocks":
+                coro = self.provision_golden_blocks(dev, force=True)
             else:
                 print("unknown command")
                 continue
+
 
             fut = asyncio.run_coroutine_threadsafe(coro, self.loop)
             try:
@@ -852,7 +1073,6 @@ async def main():
     srv = VerifierPolicyServer(golden)
     srv.loop = asyncio.get_running_loop()
 
-    # CLI thread (optional)
     t = threading.Thread(target=srv.cli_thread, daemon=True)
     t.start()
 

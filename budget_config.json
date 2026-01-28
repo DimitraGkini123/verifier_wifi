@@ -1,0 +1,11 @@
+{
+  "levels": {
+    "availability_critical": { "per_min_units": 20, "cap_units": 20, "min_k": 1 },
+    "normal":               { "per_min_units": 50, "cap_units": 50, "min_k": 1 },
+    "security_critical":    { "per_min_units": 80, "cap_units": 80, "min_k": 2 }
+  },
+  "devices": {
+    "pico2w_1": "availability_critical",
+    "pico2w_2": "normal"
+  }
+}
