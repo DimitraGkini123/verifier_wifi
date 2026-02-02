@@ -1,0 +1,14 @@
+{
+  "pico2w_2": {
+    "fw_blocks_n": 64,
+    "max_req_blocks": 32
+  },
+  "pico2w_5": {
+    "fw_blocks_n": 64,
+    "max_req_blocks": 32
+  },
+  "pico2w_1": {
+    "fw_blocks_n": 192,
+    "max_req_blocks": 32
+  }
+}

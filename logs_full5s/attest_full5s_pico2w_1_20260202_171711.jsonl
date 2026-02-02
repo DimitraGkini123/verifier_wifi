@@ -1,0 +1,9 @@
+{"ts_ms":1770045431352,"device":"pico2w_1","event":"device_registered"}
+{"ts_ms":1770045431560,"device":"pico2w_1","event":"auto_provision","resp":{"type":"OK","event":"golden_already_exists"}}
+{"ts_ms":1770045431753,"device":"pico2w_1","event":"attest","attest_kind":"FULL","trigger":"INITIAL","k":null,"indices":null,"verify_ok":true,"verify_reason":"nonce_bound_match","rtt_ms":192.6,"req_bytes":121,"resp_bytes":311}
+{"ts_ms":1770045431940,"device":"pico2w_1","event":"attest","attest_kind":"FULL","trigger":"FULL_EVERY_5S","k":null,"indices":null,"verify_ok":true,"verify_reason":"nonce_bound_match","rtt_ms":187.04,"req_bytes":121,"resp_bytes":311}
+{"ts_ms":1770045437035,"device":"pico2w_1","event":"attest","attest_kind":"FULL","trigger":"FULL_EVERY_5S","k":null,"indices":null,"verify_ok":true,"verify_reason":"nonce_bound_match","rtt_ms":277.25,"req_bytes":121,"resp_bytes":311}
+{"ts_ms":1770045442050,"device":"pico2w_1","event":"attest","attest_kind":"FULL","trigger":"FULL_EVERY_5S","k":null,"indices":null,"verify_ok":true,"verify_reason":"nonce_bound_match","rtt_ms":291.77,"req_bytes":121,"resp_bytes":311}
+{"ts_ms":1770045447063,"device":"pico2w_1","event":"attest","attest_kind":"FULL","trigger":"FULL_EVERY_5S","k":null,"indices":null,"verify_ok":false,"verify_reason":"nonce_bound_mismatch","rtt_ms":295.72,"req_bytes":121,"resp_bytes":315}
+{"ts_ms":1770045451973,"device":"pico2w_1","event":"attest","attest_kind":"FULL","trigger":"FULL_EVERY_5S","k":null,"indices":null,"verify_ok":false,"verify_reason":"nonce_bound_mismatch","rtt_ms":214.72,"req_bytes":121,"resp_bytes":315}
+{"ts_ms":1770045456991,"device":"pico2w_1","event":"attest","attest_kind":"FULL","trigger":"FULL_EVERY_5S","k":null,"indices":null,"verify_ok":false,"verify_reason":"nonce_bound_mismatch","rtt_ms":235.01,"req_bytes":121,"resp_bytes":315}

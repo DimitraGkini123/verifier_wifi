@@ -14,6 +14,7 @@ import math
 from utils import save_json_atomic, jdump, sha256, ts_ms, now_s, unhex
 from lru_blocks import DeviceLRUBlocks
 from policy_device_lr import DeviceLRPolicy
+import traceback
 
 # Policy engine that schedules GET_WINDOWS + ATTEST based on stable label
 from verifier_policy import PolicyEngine, Label as PLLabel, AttestKind as PLAttestKind
@@ -732,7 +733,8 @@ class VerifierPolicyServer:
             blob = {dev: lru.export_state() for dev, lru in self.block_lru.items()}
             save_json_atomic(LRU_STATE_PATH, blob)
         except Exception:
-            pass
+            print(f"[{now_s()}] [LRU] FAILED saving to {Path(LRU_STATE_PATH).resolve()}: {e}")
+            traceback.print_exc()
 
     def _get_block_lru(self, dev: str) -> Optional[DeviceLRUBlocks]:
         bc = self.get_block_count(dev)

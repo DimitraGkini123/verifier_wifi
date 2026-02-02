@@ -40,14 +40,21 @@ class DeviceLRUBlocks:
     def from_state(cls, state: Dict) -> "DeviceLRUBlocks":
         n = int(state.get("n_blocks", 0) or 0)
         order = state.get("order", [])
+
+        # Basic validation
         if n <= 0 or not isinstance(order, list) or len(order) != n:
             return cls.fresh(max(n, 1) if n > 0 else 1)
 
-        # Validate order is a permutation of [0..n-1]
+        # Coerce to ints
         try:
             order_int = [int(x) for x in order]
         except Exception:
             return cls.fresh(n)
 
+        # Must be a permutation of 0..n-1
         if set(order_int) != set(range(n)):
-            return
+            return cls.fresh(n)
+
+        # Build OrderedDict in that exact order (LRU -> MRU)
+        od = OrderedDict((i, None) for i in order_int)
+        return cls(n_blocks=n, _od=od)
