@@ -722,7 +722,10 @@ class VerifierPolicyServer:
             if isinstance(raw, dict):
                 for dev, st in raw.items():
                     if isinstance(st, dict):
-                        self.block_lru[dev] = DeviceLRUBlocks.from_state(st)
+                        #seed = (hash(dev) & 0xFFFFFFFF)
+                        #self.block_lru[dev] = DeviceLRUBlocks.from_state(st, seed=seed)
+
+                        self.block_lru[dev] = DeviceLRUBlocks.from_state(st)  #detem
         except FileNotFoundError:
             pass
         except Exception:
@@ -742,7 +745,9 @@ class VerifierPolicyServer:
             return None
         lru = self.block_lru.get(dev)
         if lru is None:
-            lru = DeviceLRUBlocks.fresh(bc)
+            #seed = (hash(dev) & 0xFFFFFFFF)
+            #lru = DeviceLRUBlocks.fresh(bc, seed=seed)
+            lru = DeviceLRUBlocks.fresh(bc) #for determ
             self.block_lru[dev] = lru
             self._save_lru_state()
         else:
@@ -1109,7 +1114,9 @@ class VerifierPolicyServer:
         if lru is None:
             return {"type": "ERROR", "reason": "no_golden_blocks"}
 
-        indices = sorted(lru.pick(k))
+        indices = sorted(lru.pick(k))  #for deterministic
+        #indices = lru.pick(k, pool_frac=0.25, pool_min=32) #for rand
+
         nonce = secrets.token_hex(8)
 
         resp = await self.send_request_timed(dev, {

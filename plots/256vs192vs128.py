@@ -5,10 +5,12 @@ import numpy as np
 # Put *all runs* here (seconds) for each setting
 # -------------------------------------------------
 times_256 = [245.9, 250.1, 238.7, 261.3, 247.4]  # <-- replace with your runs
-times_128 = [63.0, 58.4, 66.2, 61.9, 64.7]       # <-- replace with your runs
+times_192 = [34, 34.1, 33.9, 34.0, 34.2,]
+times_128 = [45.4, 45.7, 46, 44.9, 45.1]       # <-- replace with your runs
 
-labels = ["256 blocks", "128 blocks"]
-groups = [times_256, times_128]
+
+labels = ["256 blocks", "192 blocks", "128 blocks", ]
+groups = [times_256, times_192, times_128, ]
 
 # -------------------------------------------------
 # Compute median + IQR (Q1, Q3)
