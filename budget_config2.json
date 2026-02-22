@@ -1,0 +1,50 @@
+{
+  "levels": {
+    "availability_critical": {
+      "per_min_units": 60,
+      "cap_units": 60,
+      "min_k": 8,
+      "coverage": { "LIGHT": 0.20, "MEDIUM": 0.15, "HEAVY": 0.05, "SUSPICIOUS": 0.80 },
+
+      "attest_period_s": {
+        "LIGHT": 30.0,
+        "MEDIUM": 60.0,
+        "HEAVY": 90.0,
+        "SUSPICIOUS": 15.0
+      }
+    },
+
+    "normal": {
+      "per_min_units": 100,
+      "cap_units": 100,
+      "min_k": 8,
+      "coverage": { "LIGHT": 0.30, "MEDIUM": 0.2, "HEAVY": 0.20, "SUSPICIOUS": 0.80 },
+
+      "attest_period_s": {
+        "LIGHT": 15.0,
+        "MEDIUM": 25.0,
+        "HEAVY": 30.0,
+        "SUSPICIOUS": 8.0
+      }
+    },
+
+    "security_critical": {
+      "per_min_units": 150,
+      "cap_units": 150,
+      "min_k": 12,
+      "coverage": { "LIGHT": 0.45, "MEDIUM": 0.30, "HEAVY": 0.30, "SUSPICIOUS": 1.00 },
+
+      "attest_period_s": {
+        "LIGHT": 6.0,
+        "MEDIUM": 12.0,
+        "HEAVY": 18.0,
+        "SUSPICIOUS": 3.0
+      }
+    }
+  },
+
+  "devices": {
+    "pico2w_1": "availability_critical",
+    "pico2w_2": "security_critical"
+  }
+}

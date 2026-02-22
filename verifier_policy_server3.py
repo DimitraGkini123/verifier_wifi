@@ -1,4 +1,15 @@
 # verifier_policy_server.py
+#3nd version: deactivated the initial full hash in order to do the experiment
+#in the attestation , the response is coming in batches from the prover. If one batch fails, 
+#the whole attestation fails --> quicker detection
+#attestation period changes for different criticallity.
+#security_critical --> more frequent checks
+#availability --> less frequent,
+#normal --> something in between 
+#uses budget_config2.json
+#uses verifier_policy2.py
+
+
 import os
 from pathlib import Path
 import asyncio
@@ -17,7 +28,7 @@ from policy_device_lr import DeviceLRPolicy
 import traceback
 
 # Policy engine that schedules GET_WINDOWS + ATTEST based on stable label
-from verifier_policy import PolicyEngine, Label as PLLabel, AttestKind as PLAttestKind
+from verifier_policy2 import PolicyEngine, Label as PLLabel, AttestKind as PLAttestKind
 
 LRU_STATE_PATH = "lru_state.json"
 
@@ -26,14 +37,14 @@ PORT = 4242
 GOLDEN_PATH = "golden.json"
 
 # NEW: budget config file
-BUDGET_CFG_PATH = "budget_config.json"
-LOG_DIR = "logs_experiment_modes/security"
+BUDGET_CFG_PATH = "budget_config2.json"
+LOG_DIR = "logs_test2"
 TRUST_UNKNOWN = "UNKNOWN"
 TRUST_TRUSTED = "TRUSTED"
 TRUST_UNTRUSTED = "UNTRUSTED"
 
-AUTO_PROVISION_ON_REGISTER = True
-AUTO_PROVISION_BLOCKS_TOO = True   # αν θες και blocks
+AUTO_PROVISION_ON_REGISTER = False
+AUTO_PROVISION_BLOCKS_TOO = False   # αν θες και blocks
 AUTO_PROVISION_FORCE = False       # ΜΗΝ το κάνεις True εκτός αν θες overwrite
 AUTO_PROVISION_DELAY_S = 0.3
 
@@ -254,10 +265,12 @@ class VerifierPolicyServer:
         self.policy_tasks: Dict[str, asyncio.Task] = {}
 
         # Budget (from budget_config.json)
-        per_dev_budget, per_dev_min_k, dev_level, level_cov = self._load_budget_config(BUDGET_CFG_PATH)
-        self.device_min_k: Dict[str, int] = per_dev_min_k
-        self.device_level = dev_level                 # NEW: dev -> level_name
-        self.level_coverage = level_cov               # NEW: level_name -> {Label -> float}
+        per_dev_budget, per_dev_min_k, dev_level, level_cov, level_attest_period = self._load_budget_config(BUDGET_CFG_PATH)
+        self.device_min_k = per_dev_min_k
+        self.device_level = dev_level
+        self.level_coverage = level_cov
+        self.level_attest_period = level_attest_period
+
 
         self.budget = BudgetManager(
             default_cfg=BudgetConfig(per_min_units=50, cap_units=50, min_k=1),
@@ -495,21 +508,23 @@ class VerifierPolicyServer:
 
 
     # ----------------- budget config loader -----------------
-    def _load_budget_config(self, path: str) -> Tuple[Dict[str, BudgetConfig], Dict[str, int], Dict[str, str], Dict[str, Dict[PLLabel, float]]]:
+    def _load_budget_config(self, path: str) -> Tuple[Dict[str, BudgetConfig], Dict[str, int], Dict[str, str], Dict[str, Dict[PLLabel, float]], Dict[str, Dict[PLLabel, float]],]:
         per_device_budget: Dict[str, BudgetConfig] = {}
         per_device_min_k: Dict[str, int] = {}
         device_level: Dict[str, str] = {}  # NEW
         level_coverage: Dict[str, Dict[PLLabel, float]] = {}  # NEW
+        level_attest_period: Dict[str, Dict[PLLabel, float]] = {} #new for version 3
+
 
         try:
             with open(path, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
         except FileNotFoundError:
             print(f"[{now_s()}] [BUDGET] No {path} found. Using defaults.")
-            return per_device_budget, per_device_min_k, device_level, level_coverage
+            return per_device_budget, per_device_min_k, device_level, level_coverage, level_attest_period
         except Exception as e:
             print(f"[{now_s()}] [BUDGET] Failed to load {path}: {e}. Using defaults.")
-            return per_device_budget, per_device_min_k, device_level, level_coverage
+            return per_device_budget, per_device_min_k, device_level, level_coverage, level_attest_period
 
         levels = cfg.get("levels", {}) or {}
         devices = cfg.get("devices", {}) or {}
@@ -528,6 +543,20 @@ class VerifierPolicyServer:
             if cov_map:
                 level_coverage[lvl_name] = cov_map
 
+            ap_raw = (lvl or {}).get("attest_period_s", {}) or {}
+            ap_map: Dict[PLLabel, float] = {}
+            for k, v in ap_raw.items():
+                try:
+                    lb = PLLabel(str(k).strip().upper())
+                    sec = float(v)
+                    if sec > 0:
+                        ap_map[lb] = sec
+                except Exception:
+                    pass
+            if ap_map:
+                level_attest_period[lvl_name] = ap_map
+
+
         for dev, level_name in devices.items():
             lvl = levels.get(level_name, {}) or {}
             per_min = int(lvl.get("per_min_units", 50))
@@ -539,7 +568,7 @@ class VerifierPolicyServer:
             device_level[dev] = str(level_name)
 
         print(f"[{now_s()}] [BUDGET] loaded {len(per_device_budget)} device budgets from {path}")
-        return per_device_budget, per_device_min_k, device_level, level_coverage
+        return per_device_budget, per_device_min_k, device_level, level_coverage, level_attest_period
 
 
     # ----------------- file helpers -----------------
@@ -804,22 +833,69 @@ class VerifierPolicyServer:
         fp = self.attest_fp.get(dev)
         if not fp:
             return
+
+        # --- keep logs small: indices summary only ---
+        indices_count = len(indices) if isinstance(indices, list) else None
+
+        # --- keep ml small (avoid dumping huge dicts) ---
+        ml_small = None
+        if isinstance(ml, dict):
+            keep = (
+                "policy_reason",
+                "policy_stable_label",
+                "policy_last_majority",
+                "policy_conf",
+                "budget_reason",
+                "budget_cost_units",
+                "budget_tokens_after",
+                "budget_tokens_before",
+                "budget_fit_kind",
+                "budget_fit_k",
+                "device_level",
+                "target_coverage",
+                "final_coverage",
+                "escalation_from",
+            )
+            ml_small = {k: ml.get(k) for k in keep if k in ml}
+
+        # --- support totals if batched ---
+        rtt_ms = resp.get("_rtt_ms_total", resp.get("_rtt_ms"))
+        req_bytes = resp.get("_req_bytes_total", resp.get("_req_bytes"))
+        resp_bytes = resp.get("_resp_bytes_total", resp.get("_resp_bytes"))
+
+        # (optional) if your verifier adds batch metadata:
+        batched = bool(resp.get("_batched", False))
+        batch_size = resp.get("_batch_size") if batched else None
+        batch_index = resp.get("_batch_index") if batched else None
+        batch_count = resp.get("_batch_count") if batched else None
+
         self._jwrite(fp, {
             "ts_ms": ts_ms(),
             "device": dev,
             "event": "attest",
             "attest_kind": kind,
             "trigger": trigger,
-            "ml": ml,
+
+            "ml": ml_small,               # <<< smaller ml
             "k": k,
-            "indices": indices,
+
+            # <<< never dump the full list
+            "indices_count": indices_count,
+
+            # useful debug for batched early-stop
+            "batched": batched,
+            "batch_size": batch_size,
+            "batch_index": batch_index,
+            "batch_count": batch_count,
+
             "trust_before": trust_before,
             "trust_after": trust_after,
             "verify_ok": resp.get("verify_ok"),
             "verify_reason": resp.get("verify_reason", resp.get("reason")),
-            "rtt_ms": resp.get("_rtt_ms"),
-            "req_bytes": resp.get("_req_bytes"),
-            "resp_bytes": resp.get("_resp_bytes"),
+            "rtt_ms": rtt_ms,
+            "req_bytes": req_bytes,
+            "resp_bytes": resp_bytes,
+
             "budget_tokens_after": resp.get("_budget_tokens_after"),
             "budget_cost_units": resp.get("_budget_cost_units"),
         })
@@ -1101,8 +1177,95 @@ class VerifierPolicyServer:
             trigger=trigger, ml=ml
         )
         return resp
+    
+
+    def _chunk(self, xs: List[int], n: int) -> List[List[int]]:
+        return [xs[i:i+n] for i in range(0, len(xs), n)]
+
+    async def _attest_partial_once_indices(self, dev: str, indices: List[int], nonce: str, timeout: float = 12.0) -> dict:
+        # guard: ποτέ empty indices
+        if not indices:
+            return {"type": "ERROR", "reason": "empty_indices"}
+
+        resp = await self.send_request_timed(dev, {
+            "type": "ATTEST_REQUEST",
+            "mode": "PARTIAL_BLOCKS",
+            "region": "fw",
+            "nonce": nonce,
+            "indices": indices,
+        }, timeout=timeout)
+
+        # για logging/debug
+        if isinstance(resp, dict):
+            resp["_indices"] = indices
+            resp["_k"] = len(indices)
+        return resp
 
 
+    async def attest_partial_batched_once(self, dev: str, k: int, timeout: float = 12.0) -> dict:
+        bc = self.get_block_count(dev)
+        if bc <= 0:
+            return {"type": "ERROR", "reason": "no_golden_blocks"}
+
+        k = max(1, min(int(k), bc))
+        lru = self._get_block_lru(dev)
+        if lru is None:
+            return {"type": "ERROR", "reason": "no_golden_blocks"}
+
+        # ΠΑΡΕ ΟΛΑ τα indices που θες μια φορά
+        indices_all = lru.pick(k, pool_frac=0.25, pool_min=32)  # ή deterministic αν θες
+        # indices_all = sorted(indices_all)  # optional: deterministic ordering
+
+        # batch size: ιδανικά min(max_req_blocks, 32)
+        caps = self._caps(dev)
+        max_req = int(caps.get("max_req_blocks", 32) or 32)
+        batch = max(1, min(32, max_req))
+
+        chunks = self._chunk(indices_all, batch)
+
+        nonce = secrets.token_hex(8)  # ίδιο nonce για όλα τα chunks -> ίδιο session binding
+
+        t0 = time.perf_counter()
+        req_bytes_sum = 0
+        resp_bytes_sum = 0
+
+        last_resp: dict = {"type": "ERROR", "reason": "no_chunks"}
+
+        for bi, chunk in enumerate(chunks):
+            r = await self._attest_partial_once_indices(dev, chunk, nonce=nonce, timeout=timeout)
+
+            # μάζεψε μετρικά (optional)
+            if isinstance(r, dict):
+                req_bytes_sum += int(r.get("_req_bytes", 0) or 0)
+                resp_bytes_sum += int(r.get("_resp_bytes", 0) or 0)
+
+            last_resp = r if isinstance(r, dict) else {"type": "ERROR", "reason": "bad_resp"}
+
+            # EARLY STOP by batch
+            if not bool(last_resp.get("verify_ok", False)):
+                last_resp["_batched"] = True
+                last_resp["_batch_size"] = batch
+                last_resp["_batch_index"] = bi
+                last_resp["_indices_all"] = indices_all
+                last_resp["_k_total"] = k
+                last_resp["_nonce"] = nonce
+                return last_resp
+
+        # αν φτάσαμε εδώ, όλα τα batches OK
+        rtt_ms = (time.perf_counter() - t0) * 1000.0
+        ok_resp = dict(last_resp)
+        ok_resp["verify_ok"] = True
+        ok_resp["verify_reason"] = "ok"
+        ok_resp["_batched"] = True
+        ok_resp["_batch_size"] = batch
+        ok_resp["_batch_count"] = len(chunks)
+        ok_resp["_indices_all"] = indices_all
+        ok_resp["_k_total"] = k
+        ok_resp["_nonce"] = nonce
+        ok_resp["_rtt_ms_total"] = round(rtt_ms, 2)
+        ok_resp["_req_bytes_total"] = req_bytes_sum
+        ok_resp["_resp_bytes_total"] = resp_bytes_sum
+        return ok_resp
 
     async def attest_partial_once(self, dev: str, k: int, timeout: float = 12.0) -> dict:
         bc = self.get_block_count(dev)
@@ -1141,20 +1304,21 @@ class VerifierPolicyServer:
             trust_before = dc.trust_state
 
             # 1) PARTIAL
-            resp = await self.attest_partial_once(dev, k=k, timeout=12.0)
+            #resp = await self.attest_partial_once(dev, k=k, timeout=12.0)
+            resp = await self.attest_partial_batched_once(dev, k=k, timeout=12.0)
             self._update_trust_from_attest(dev, resp if isinstance(resp, dict) else {}, attempt=1)
 
             # touch LRU only if ok
             if isinstance(resp, dict) and resp.get("verify_ok", False):
-                idxs = resp.get("_indices") or []
+                idxs_all = resp.get("_indices_all") or resp.get("_indices") or []
                 lru = self._get_block_lru(dev)
-                if lru is not None and idxs:
-                    lru.touch(idxs)
+                if lru is not None and idxs_all:
+                    lru.touch(idxs_all)
                     self._save_lru_state()
 
             trust_after = dc.trust_state if dev in self.devices else TRUST_UNKNOWN
-            indices = resp.get("_indices") if isinstance(resp, dict) else None
-            kk = resp.get("_k") if isinstance(resp, dict) else k
+            indices = resp.get("_indices_all") if isinstance(resp, dict) else None
+            kk = resp.get("_k_total") if isinstance(resp, dict) else k
 
             # budget meta -> resp for logging
             if isinstance(resp, dict) and ml:
@@ -1609,6 +1773,13 @@ class VerifierPolicyServer:
         }
         self._save_device_caps()
 
+        # ---- NEW: ensure device has a level (criticality) mapping ----
+        # If not present in budget_config.json "devices", default to "normal".
+        if not hasattr(self, "device_level") or not isinstance(self.device_level, dict):
+            self.device_level = {}
+        if device_id not in self.device_level:
+            self.device_level[device_id] = "normal"  #default is normal
+
         dc = DeviceConn(device_id=device_id, reader=reader, writer=writer)
         self.devices[device_id] = dc
         if self.selected_device is None:
@@ -1617,7 +1788,25 @@ class VerifierPolicyServer:
         self._open_files_for(device_id)
         fp_evt = self.events_fp.get(device_id)
         if fp_evt:
-            self._jwrite(fp_evt, {"ts_ms": ts_ms(), "device": device_id, "event": "device_registered"})
+            self._jwrite(fp_evt, {"ts_ms": ts_ms(), "device": device_id, "event": "device_registered"}, )
+
+        # --- Apply per-level attest_period_s to policy engine (per device) ---
+        try:
+            from verifier_policy2 import PolicyConfig
+
+            level = getattr(self, "device_level", {}).get(device_id, "normal")
+            ap = getattr(self, "level_attest_period", {}).get(level, {}) or {}
+
+            cfg = PolicyConfig()  # start from defaults
+            for lb, sec in ap.items():
+                cfg.attest_period_s[lb] = float(sec)
+
+            self.policy.set_device_config(device_id, cfg)
+            #self.policy.devices.pop(device_id, None) #resets
+            print(f"[{now_s()}] [POLICY] dev={device_id} level={level} attest_period_s="
+          + ",".join([f"{lb.value}:{cfg.attest_period_s.get(lb)}" for lb in PLLabel]))
+        except Exception:
+            pass
 
         if AUTO_PROVISION_ON_REGISTER:
             asyncio.create_task(self.auto_provision_on_register(device_id))

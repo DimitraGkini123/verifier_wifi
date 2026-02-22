@@ -8,7 +8,7 @@
     "max_req_blocks": 32
   },
   "pico2w_1": {
-    "fw_blocks_n": 128,
+    "fw_blocks_n": 256,
     "max_req_blocks": 32
   }
 }

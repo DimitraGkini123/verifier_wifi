@@ -1,5 +1,5 @@
 ## detection time and memory coverage for attack detection under different modes
-## injection of 1009 bytes 
+## injectiom of 65065 bytes
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -10,13 +10,13 @@ import matplotlib.pyplot as plt
 
 # Detection times (seconds)
 baseline_times     = [0.2, 0.15]   # Full hash every 5s
-availability_times = [125, 63.5]
+availability_times = [33.52, 40.2]
 normal_times       = [18, 30.1]
 security_times     = [9, 6]
 
 # Memory traversals (1.0 = one full firmware traversal)
 baseline_mem       = [1.0, 1.0]
-availability_mem   = [1.17, 0.36]
+availability_mem   = [0.36, 0.36]
 normal_mem         = [0.5, 0.7]
 security_mem       = [0.75, 0.6]
 

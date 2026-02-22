@@ -1,20 +1,26 @@
 {
   "levels": {
     "availability_critical": {
-      "per_min_units": 20, "cap_units": 20, "min_k": 1,
-      "coverage": { "LIGHT": 0.60, "MEDIUM": 0.35, "HEAVY": 0.20, "SUSPICIOUS": 0.80 }
+      "per_min_units": 60,
+      "cap_units": 60,
+      "min_k": 8,
+      "coverage": { "LIGHT": 0.40, "MEDIUM": 0.35, "HEAVY": 0.20, "SUSPICIOUS": 0.80 }
     },
     "normal": {
-      "per_min_units": 60, "cap_units": 70, "min_k": 1,
-      "coverage": { "LIGHT": 0.60, "MEDIUM": 0.40, "HEAVY": 0.20, "SUSPICIOUS": 0.80 }
+      "per_min_units": 100,
+      "cap_units": 100,
+      "min_k": 8,
+      "coverage": { "LIGHT": 0.50, "MEDIUM": 0.40, "HEAVY": 0.20, "SUSPICIOUS": 0.80 }
     },
     "security_critical": {
-      "per_min_units": 80, "cap_units": 120, "min_k": 2,
-      "coverage": { "LIGHT": 0.80, "MEDIUM": 0.60, "HEAVY": 0.40, "SUSPICIOUS": 1.00 }
+      "per_min_units": 150,
+      "cap_units": 150,
+      "min_k": 12,
+      "coverage": { "LIGHT": 0.60, "MEDIUM": 0.50, "HEAVY": 0.30, "SUSPICIOUS": 1.00 }
     }
   },
   "devices": {
     "pico2w_1": "availability_critical",
-    "pico2w_2": "normal"
+    "pico2w_2": "security_critical"
   }
 }

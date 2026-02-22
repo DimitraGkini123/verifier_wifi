@@ -1,0 +1,15 @@
+{"ts_ms":1771365404011,"device":"pico2w_1","event":"device_registered"}
+{"ts_ms":1771365404030,"device":"pico2w_1","event":"policy_get_windows_done","since":0,"max":8,"rtt_ms":18,"resp_type":"WINDOWS","reason":"init"}
+{"ts_ms":1771365404030,"device":"pico2w_1","event":"budget_gate","device_level":"availability_critical","ideal":{"kind":"PARTIAL","k":359,"target_coverage":0.35,"ideal_coverage":0.351},"fit":{"kind":"PARTIAL","k":359,"cost_units":35,"final_coverage":0.351},"min_k":8,"block_count":1024,"tokens_before":60.0,"reason":"budget_ok_partial"}
+{"ts_ms":1771365404248,"device":"pico2w_1","event":"partial_failed_escalate_full","partial_reason":"block_311_mismatch"}
+{"ts_ms":1771365404312,"device":"pico2w_1","event":"auto_provision_check_start"}
+{"ts_ms":1771365404312,"device":"pico2w_1","event":"auto_provision_sanity_full_attest_start"}
+{"ts_ms":1771365405628,"device":"pico2w_1","event":"policy_skip_get_windows_attest_inflight","reason":"init"}
+{"ts_ms":1771365405728,"device":"pico2w_1","event":"quarantine_entered","reason":"escalated_full_failed:nonce_bound_mismatch","full_hash_fail_streak":2}
+{"ts_ms":1771365405863,"device":"pico2w_1","event":"quarantine_recheck_start","interval_s":10.0}
+{"ts_ms":1771365407175,"device":"pico2w_1","event":"auto_provision_sanity_full_attest_done","verify_ok":false,"verify_reason":"nonce_bound_mismatch"}
+{"ts_ms":1771365408594,"device":"pico2w_1","event":"quarantine_recheck_done","verify_ok":false,"verify_reason":"nonce_bound_mismatch"}
+{"ts_ms":1771365408827,"device":"pico2w_1","event":"quarantine_skip_get_windows","policy_reason":"init"}
+{"ts_ms":1771365410459,"device":"pico2w_1","event":"quarantine_skip_get_windows","policy_reason":"init"}
+{"ts_ms":1771365412134,"device":"pico2w_1","event":"quarantine_skip_get_windows","policy_reason":"init"}
+{"ts_ms":1771365413719,"device":"pico2w_1","event":"quarantine_skip_get_windows","policy_reason":"init"}

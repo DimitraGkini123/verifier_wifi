@@ -109,6 +109,8 @@ class PolicyEngine:
         self.enable_get_windows = bool(enable_get_windows)
         self.cfg = config or PolicyConfig()
         self.devices: Dict[str, DevicePolicyState] = {}
+        self.cfg_by_dev: Dict[str, PolicyConfig] = {}
+
 
     def _st(self, dev: str) -> DevicePolicyState:
         st = self.devices.get(dev)
@@ -116,6 +118,10 @@ class PolicyEngine:
             st = DevicePolicyState()
             self.devices[dev] = st
         return st
+    
+    def set_device_config(self, dev: str, cfg: PolicyConfig) -> None:
+        self.cfg_by_dev[dev] = cfg
+
 
     @staticmethod
     def _majority(labels: List[Label]) -> InferenceSummary:
@@ -163,33 +169,36 @@ class PolicyEngine:
             st.last_reason = f"stable_changed:{old.value}->{st.stable_label.value}"
 
             # when label changes, allow immediate scheduling (reset timers)
+            cfg = self.cfg_by_dev.get(dev, self.cfg)
             st.next_get_windows_ts = 0.0
-            st.next_attest_ts = 0.0
+            st.next_attest_ts = now + float(cfg.attest_period_s[st.stable_label])  # schedule from now
 
         return summ
 
     def tick(self, dev: str, now: float) -> PolicyDecision:
         st = self._st(dev)
         lb = st.stable_label
+        cfg = self.cfg_by_dev.get(dev, self.cfg)
+
 
         # schedule GET_WINDOWS
         do_get = False
-        gw_max = self.cfg.get_windows_max[lb]
+        gw_max = cfg.get_windows_max[lb]
         if self.enable_get_windows:
             if now >= st.next_get_windows_ts:
                 do_get = True
-                st.next_get_windows_ts = now + float(self.cfg.get_windows_period_s[lb])
+                st.next_get_windows_ts = now + float(cfg.get_windows_period_s[lb])
 
         # schedule ATTEST
         kind = AttestKind.NONE
         cov = 0.0
         if now >= st.next_attest_ts and now >= st.attest_cooldown_s:
-            kind = self.cfg.attest_kind[lb]
+            kind = cfg.attest_kind[lb]
             if kind == AttestKind.PARTIAL:
-                cov = float(self.cfg.partial_coverage[lb])
+                cov = float(cfg.partial_coverage[lb])
                 cov = max(0.0, min(1.0, cov))
-            st.next_attest_ts = now + float(self.cfg.attest_period_s[lb])
-            st.attest_cooldown_s = now + float(self.cfg.min_attest_cooldown_s)
+            st.next_attest_ts = now + float(cfg.attest_period_s[lb])
+            st.attest_cooldown_s = now + float(cfg.min_attest_cooldown_s)
 
         return PolicyDecision(
             do_get_windows=do_get,
